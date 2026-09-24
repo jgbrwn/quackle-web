@@ -1,0 +1,24 @@
+{
+  "position": {
+    "version": 1,
+    "lexicon_id": "nwl23",
+    "board": {
+      "id": "classic15",
+      "cells": []
+    },
+    "rack": "ADEIRST",
+    "players": {
+      "on_turn": { "score": 0 },
+      "opponent": { "score": 0, "rack": null }
+    },
+    "turn": {
+      "number": 0,
+      "scoreless_turns": 0
+    },
+    "unseen": { "mode": "derive" }
+  },
+  "options": {
+    "limit": 20,
+    "include_exchanges": true
+  }
+}

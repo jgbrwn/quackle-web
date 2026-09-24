@@ -1,0 +1,32 @@
+{
+  "name": "quackle-web",
+  "version": "0.1.0",
+  "description": "Mobile-first Quackle-compatible crossword analysis PWA and local engine protocol adapters",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "packageManager": "pnpm@10.34.0",
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "scripts": {
+    "web:dev": "vite --config product/web/vite.config.ts",
+    "web:build": "vite build --config product/web/vite.config.ts",
+    "build": "pnpm web:build",
+    "web:test": "vitest run product/shared/gcg.test.ts product/shared/cross-tables.test.ts",
+    "test:e2e": "playwright test",
+    "test:lexicon": "python3 -m unittest discover -s product/lexicon-tools/tests -p 'test_*.py' -v",
+    "test:go": "go -C product/server/go test -race ./...",
+    "test": "pnpm web:test && pnpm web:build && pnpm test:lexicon",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "preact": "10.29.8"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "prettier": "3.9.8",
+    "typescript": "7.0.2",
+    "vite": "8.3.0",
+    "vitest": "5.0.1"
+  }
+}

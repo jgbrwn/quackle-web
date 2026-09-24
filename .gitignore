@@ -1,0 +1,68 @@
+# Node and package-manager output
+node_modules/
+.pnpm-store/
+.pnpm-debug.log*
+.npmrc
+
+# Builds and local development
+*.tsbuildinfo
+dist/
+product/web/dist/
+coverage/
+test-results/
+playwright-report/
+
+# Python, Go, native, and editor output
+__pycache__/
+*.py[cod]
+*.test
+*.out
+.build/
+product/**/build/
+product/**/out/
+.vscode/
+.idea/
+.DS_Store
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+.wrangler/
+.cloudflare/
+.netrc
+credentials.json
+credentials.local.json
+secrets/
+
+# Keys, certificates, tokens, and state files
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.token
+*.secret
+*.secrets
+*.tfstate
+*.tfstate.*
+*.sqlite
+*.sqlite3
+*.db
+
+# Restricted/generated lexicon and engine artifacts
+.local/
+private-data/
+artifacts/
+*.dawg
+*.gaddag
+*.raw
+*.bin
+
+# OS/editor swap files
+*.swp
+*.swo
+*~

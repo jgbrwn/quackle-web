@@ -1,0 +1,72 @@
+{
+  "fixture": "empty-opening-ADEIRST",
+  "seed": 123456789,
+  "limit": 5,
+  "moves": [
+    {
+      "action": "place",
+      "position": "8D",
+      "row": 7,
+      "col": 3,
+      "horizontal": true,
+      "tiles": "DISRATE",
+      "used_tiles": "DISRATE",
+      "word": "DISRATE",
+      "score": 70,
+      "equity": 72.45531,
+      "is_bingo": true
+    },
+    {
+      "action": "place",
+      "position": "8B",
+      "row": 7,
+      "col": 1,
+      "horizontal": true,
+      "tiles": "ARIDEST",
+      "used_tiles": "ARIDEST",
+      "word": "ARIDEST",
+      "score": 68,
+      "equity": 71.59455,
+      "is_bingo": true
+    },
+    {
+      "action": "place",
+      "position": "8D",
+      "row": 7,
+      "col": 3,
+      "horizontal": true,
+      "tiles": "DIASTER",
+      "used_tiles": "DIASTER",
+      "word": "DIASTER",
+      "score": 70,
+      "equity": 71.39805,
+      "is_bingo": true
+    },
+    {
+      "action": "place",
+      "position": "8G",
+      "row": 7,
+      "col": 6,
+      "horizontal": true,
+      "tiles": "TARDIES",
+      "used_tiles": "TARDIES",
+      "word": "TARDIES",
+      "score": 68,
+      "equity": 71.36349,
+      "is_bingo": true
+    },
+    {
+      "action": "place",
+      "position": "8F",
+      "row": 7,
+      "col": 5,
+      "horizontal": true,
+      "tiles": "ASTRIDE",
+      "used_tiles": "ASTRIDE",
+      "word": "ASTRIDE",
+      "score": 68,
+      "equity": 71.33243,
+      "is_bingo": true
+    }
+  ]
+}

@@ -1,0 +1,73 @@
+--- a/datamanager.h
++++ b/datamanager.h
+@@ -20,6 +20,7 @@
+ #define QUACKLE_DATAMANAGER_H
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <iterator>
+ #include <random>
+ #include <string>
+@@ -175,6 +176,9 @@
+ 	// gets its own independently-seeded generator.
+ 	static thread_local std::mt19937_64 m_mersenneTwisterRng;
+ 	static thread_local bool m_rngSeeded;
++	static std::atomic<unsigned int> m_rngSeed;
++	static std::atomic<unsigned int> m_rngEpoch;
++	static thread_local unsigned int m_rngEpochSeen;
+ };
+ 
+ inline DataManager *DataManager::self()
+--- a/datamanager.cpp
++++ b/datamanager.cpp
+@@ -44,6 +44,9 @@
+ 
+ thread_local mt19937_64 DataManager::m_mersenneTwisterRng;
+ thread_local bool DataManager::m_rngSeeded = false;
++atomic<unsigned int> DataManager::m_rngSeed { 0 };
++atomic<unsigned int> DataManager::m_rngEpoch { 0 };
++thread_local unsigned int DataManager::m_rngEpochSeen = 0;
+ 
+ DataManager::DataManager()
+ 	: m_evaluator(0), m_parameters(0), m_alphabetParameters(0), m_boardParameters(0), m_lexiconParameters(0), m_strategyParameters(0)
+@@ -188,24 +191,36 @@
+ 
+ void DataManager::seedRandomNumbers(unsigned int seed)
+ {
++	m_rngSeed.store(seed, memory_order_relaxed);
++	const unsigned int epoch = m_rngEpoch.fetch_add(1, memory_order_acq_rel) + 1;
+ 	m_mersenneTwisterRng.seed(seed);
+ 	m_rngSeeded = true;
++	m_rngEpochSeen = epoch;
+ }
+ 
+ void DataManager::seedRandomNumbers(seed_seq &seed)
+ {
++	const unsigned int epoch = m_rngEpoch.fetch_add(1, memory_order_acq_rel) + 1;
+ 	m_mersenneTwisterRng.seed(seed);
+ 	m_rngSeeded = true;
++	m_rngEpochSeen = epoch;
+ }
+ 
+ void DataManager::ensureRngSeeded()
+ {
+-	if (!m_rngSeeded)
++	const unsigned int epoch = m_rngEpoch.load(memory_order_acquire);
++	if (!m_rngSeeded || m_rngEpochSeen != epoch)
+ 	{
+-		seed_seq seed = { (unsigned)random_device {}(), (unsigned)time(nullptr),
+-			(unsigned)hash<thread::id>{}(this_thread::get_id()) };
+-		m_mersenneTwisterRng.seed(seed);
++		if (m_rngEpochSeen != epoch)
++			m_mersenneTwisterRng.seed(m_rngSeed.load(memory_order_relaxed));
++		else
++		{
++			seed_seq seed = { (unsigned)random_device {}(), (unsigned)time(nullptr),
++				(unsigned)hash<thread::id>{}(this_thread::get_id()) };
++			m_mersenneTwisterRng.seed(seed);
++		}
+ 		m_rngSeeded = true;
++		m_rngEpochSeen = epoch;
+ 	}
+ }
+ 

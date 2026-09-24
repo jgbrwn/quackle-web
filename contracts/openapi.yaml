@@ -1,0 +1,463 @@
+openapi: 3.1.0
+info:
+  title: Quackle Web HTTP API
+  version: 0.2.0
+  description: Public session and analysis contract for hosted Quackle Web-compatible services.
+servers:
+  - url: /api/v1
+paths:
+  /meta:
+    get:
+      operationId: getMeta
+      responses:
+        "200":
+          description: Build, capability, board, engine, and default lexicon metadata.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Meta" }
+  /sessions:
+    post:
+      operationId: createSession
+      responses:
+        "201":
+          description: Session created; implementation also sets an HttpOnly capability cookie.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionEnvelope" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /sessions/{sessionId}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: getSession
+      responses:
+        "200":
+          description: Canonical session without waking native compute.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionEnvelope" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      operationId: updateSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expectedRevision, state]
+              properties:
+                expectedRevision: { type: integer, minimum: 0 }
+                state: { $ref: "#/components/schemas/SessionState" }
+              additionalProperties: false
+      responses:
+        "200":
+          description: Updated session.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionEnvelope" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+  /sessions/{sessionId}/moves/generate:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      operationId: generateMoves
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sessionRevision, options]
+              properties:
+                sessionRevision: { type: integer, minimum: 0 }
+                options: { $ref: "#/components/schemas/GenerateOptions" }
+              additionalProperties: false
+      responses:
+        "200":
+          description: Ranked static moves from warm or cold native compute.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [identity, moves]
+                properties:
+                  identity: { $ref: "#/components/schemas/ResultIdentity" }
+                  moves:
+                    type: array
+                    items: { $ref: "#/components/schemas/Move" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Deadline" }
+  /sessions/{sessionId}/analysis/jobs:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      operationId: createAnalysisJob
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 16, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sessionRevision, options]
+              properties:
+                sessionRevision: { type: integer, minimum: 0 }
+                options: { $ref: "#/components/schemas/AnalysisOptions" }
+              additionalProperties: false
+      responses:
+        "202":
+          description: Persisted job accepted for dispatch.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobEnvelope" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /sessions/{sessionId}/analysis/jobs/{jobId}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/JobId"
+    get:
+      operationId: getAnalysisJob
+      responses:
+        "200":
+          description: Authoritative persisted job.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobEnvelope" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      operationId: cancelAnalysisJob
+      responses:
+        "200":
+          description: Idempotently cancelled or existing terminal job.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobEnvelope" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /sessions/{sessionId}/analysis/jobs/{jobId}/retry:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/JobId"
+    post:
+      operationId: retryAnalysisJob
+      description: Requeue an interrupted or retryable failed job using its stored canonical request.
+      responses:
+        "202":
+          description: Job requeued for another bounded attempt.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobEnvelope" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /sessions/{sessionId}/events:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: connectSessionEvents
+      description: WebSocket upgrade for session events.
+      responses:
+        "101": { description: Switching Protocols }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /sessions/{sessionId}/lexicons:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      operationId: uploadLexicon
+      description: Upload strict UTF-8 one-word-per-line text. Server normalizes and hashes authoritatively.
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+              maxLength: 5242880
+      responses:
+        "202":
+          description: Existing verified artifact reused or build accepted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LexiconEnvelope" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /sessions/{sessionId}/lexicons/{lexiconId}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - name: lexiconId
+        in: path
+        required: true
+        schema: { type: string, minLength: 8, maxLength: 128 }
+    get:
+      operationId: getLexicon
+      responses:
+        "200":
+          description: Authorized manifest/build status; never raw words or artifacts.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LexiconEnvelope" }
+        "404": { $ref: "#/components/responses/NotFound" }
+components:
+  parameters:
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      schema: { type: string, minLength: 20, maxLength: 128 }
+    JobId:
+      name: jobId
+      in: path
+      required: true
+      schema: { type: string, minLength: 20, maxLength: 128 }
+  responses:
+    BadRequest:
+      description: Malformed request.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unprocessable:
+      description: Domain-invalid request.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: Revision, idempotency, or compatibility conflict.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Not found or not authorized.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    TooLarge:
+      description: Body/list exceeds configured limits.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Rate, quota, or concurrency limit.
+      headers:
+        Retry-After: { schema: { type: integer, minimum: 1 } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unavailable:
+      description: Compute unavailable or saturated.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Deadline:
+      description: Compute deadline exceeded.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Meta:
+      type: object
+      required: [apiVersion, capabilities, defaultLexicon]
+      properties:
+        apiVersion: { const: 1 }
+        capabilities: { type: object, additionalProperties: true }
+        defaultLexicon: { $ref: "#/components/schemas/Lexicon" }
+      additionalProperties: true
+    SessionEnvelope:
+      type: object
+      required: [session]
+      properties:
+        session: { $ref: "#/components/schemas/Session" }
+      additionalProperties: false
+    Session:
+      type: object
+      required: [version, id, revision, state, createdAt, updatedAt]
+      properties:
+        version: { const: 1 }
+        id: { type: string }
+        revision: { type: integer, minimum: 0 }
+        state: { $ref: "#/components/schemas/SessionState" }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      additionalProperties: false
+    SessionState:
+      type: object
+      required: [position, lexiconId, boardId]
+      properties:
+        position: { $ref: "#/components/schemas/Position" }
+        lexiconId: { type: string, maxLength: 128 }
+        boardId: { const: classic15 }
+        history: { type: array, items: { type: object } }
+        analysisPreferences: { type: object }
+      additionalProperties: false
+    Position:
+      type: object
+      required: [version, board, rack, scores, turn, unseen]
+      properties:
+        version: { const: 1 }
+        board:
+          type: object
+          required: [id, cells]
+          properties:
+            id: { const: classic15 }
+            cells:
+              type: array
+              maxItems: 225
+              items:
+                type: object
+                required: [row, col, letter, blank]
+                properties:
+                  row: { type: integer, minimum: 0, maximum: 14 }
+                  col: { type: integer, minimum: 0, maximum: 14 }
+                  letter: { type: string, pattern: "^[A-Z]$" }
+                  blank: { type: boolean }
+                additionalProperties: false
+          additionalProperties: false
+        rack: { type: string, pattern: "^[A-Z?]{0,7}$" }
+        scores:
+          type: object
+          required: [onTurn, opponent]
+          properties:
+            onTurn: { type: integer, minimum: 0 }
+            opponent: { type: integer, minimum: 0 }
+          additionalProperties: false
+        turn:
+          type: object
+          required: [number, scorelessTurns]
+          properties:
+            number: { type: integer, minimum: 1 }
+            scorelessTurns: { type: integer, minimum: 0, maximum: 6 }
+          additionalProperties: false
+        unseen: { type: object }
+      additionalProperties: false
+    GenerateOptions:
+      type: object
+      properties:
+        candidateLimit: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        deadlineMs:
+          { type: integer, minimum: 100, maximum: 5000, default: 2000 }
+        includeExchanges: { type: boolean, default: true }
+        seed:
+          { type: integer, minimum: 0, maximum: 4294967295, default: 123456789 }
+      additionalProperties: false
+    AnalysisOptions:
+      type: object
+      required: [budgetMs, candidateLimit]
+      properties:
+        budgetMs: { type: integer, minimum: 1000, maximum: 60000 }
+        candidateLimit: { type: integer, minimum: 1, maximum: 50 }
+        seed: { type: integer, minimum: 0, maximum: 4294967295 }
+      additionalProperties: false
+    Move:
+      type: object
+      required: [id, action, rank]
+      properties:
+        id: { type: string }
+        action: { enum: [place, exchange, pass] }
+        rank: { type: integer, minimum: 1 }
+        score: { type: integer }
+        equity: { type: [number, "null"] }
+        word: { type: string }
+      additionalProperties: true
+    ResultIdentity:
+      type: object
+      required:
+        [sessionRevision, engineId, protocol, lexiconId, positionHash, seed]
+      properties:
+        sessionRevision: { type: integer }
+        engineId: { type: string }
+        protocol: { type: integer }
+        lexiconId: { type: string }
+        positionHash: { type: string }
+        seed: { type: integer }
+        coldStart: { type: boolean }
+      additionalProperties: false
+    JobEnvelope:
+      type: object
+      required: [job]
+      properties:
+        job: { $ref: "#/components/schemas/Job" }
+      additionalProperties: false
+    Job:
+      type: object
+      required:
+        [
+          id,
+          sessionRevision,
+          status,
+          attempt,
+          progressSeq,
+          progress,
+          createdAt,
+          updatedAt,
+        ]
+      properties:
+        id: { type: string }
+        sessionRevision: { type: integer }
+        attempt: { type: integer, minimum: 1 }
+        progressSeq: { type: integer, minimum: 0 }
+        progress: { oneOf: [{ type: object }, { type: "null" }] }
+        status:
+          enum:
+            [
+              queued,
+              starting,
+              running,
+              succeeded,
+              failed,
+              cancelled,
+              interrupted,
+            ]
+        identity:
+          {
+            oneOf:
+              [
+                { $ref: "#/components/schemas/ResultIdentity" },
+                { type: "null" },
+              ],
+          }
+        result: { type: [object, "null"] }
+        error:
+          { oneOf: [{ $ref: "#/components/schemas/Error" }, { type: "null" }] }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      additionalProperties: false
+    LexiconEnvelope:
+      type: object
+      required: [lexicon]
+      properties:
+        lexicon: { $ref: "#/components/schemas/Lexicon" }
+      additionalProperties: false
+    Lexicon:
+      type: object
+      required: [id, displayName, status, sourceKind, strategyCompatibility]
+      properties:
+        id: { type: string }
+        displayName: { type: string, maxLength: 80 }
+        status: { enum: [building, ready, failed, expired] }
+        sourceKind: { enum: [default, visitor_upload] }
+        wordCount: { type: [integer, "null"] }
+        strategyCompatibility: { enum: [reviewed, generic, none] }
+        error:
+          { oneOf: [{ $ref: "#/components/schemas/Error" }, { type: "null" }] }
+      additionalProperties: false
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, retryable, requestId]
+          properties:
+            code: { type: string, pattern: "^[a-z0-9_]+$" }
+            message: { type: string, maxLength: 1024 }
+            retryable: { type: boolean }
+            requestId: { type: string }
+            details: { type: object }
+          additionalProperties: false
+      additionalProperties: false

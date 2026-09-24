@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/quackle/quackle",
+  "default_branch": "master",
+  "commit": "6a41f7c0b40216c611abada4be08b1920006e62c",
+  "tree": "f1420cbdb225f014d2d51b1491b6680214cd3cb0",
+  "lexicon_catalog": "references/upstream-lexica.json",
+  "commit_date_utc": "2026-09-17T03:28:14Z",
+  "research_date_utc": "2026-09-22",
+  "license": "GPL-3.0-or-later; some dictionary assets separately restricted",
+  "data_lexica": {
+    "nwl23.dawg": {
+      "git_blob_sha1": "3c4ede81d512fc6ea756401ef895d4fb6cc9be50",
+      "sha256": "087873b9e8644f02957e14bc8b97c7553e552456e44c60068a0ae36dbefc3e2c",
+      "size": 1069869
+    }
+  },
+  "related_design_repository": "https://github.com/blackrobot/quackle-mobile"
+}
