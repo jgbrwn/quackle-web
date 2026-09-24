@@ -15,6 +15,7 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22.14.0
+          package-manager-cache: false
       - name: Enable pnpm
         run: corepack enable
       - name: Install dependencies
