@@ -67,30 +67,45 @@ async function mockSessionApi(
       }),
     });
   });
-  await page.route(/https:\/\/www\.cross-tables\.com\/.*/, async (route) => {
-    const url = new URL(route.request().url());
-    if (url.pathname.endsWith(".gcg")) {
+  await page.route("**/api/v1/imports/cross-tables", async (route) => {
+    const body = JSON.parse(route.request().postData() ?? "{}") as {
+      url?: string;
+    };
+    if (body.url !== "https://www.cross-tables.com/annotated.php?u=5241") {
       await route.fulfill({
-        status: 200,
-        contentType: "text/plain",
-        headers: { "access-control-allow-origin": "*" },
-        body: `#character-encoding UTF-8\n#title Cross-Tables fixture\n#player1 A Alice\n#player2 B Bob\n#lexicon NWL23\n>A: ADEIRST 8D DISRATE +70 70\n>B: ABCDEFG - 0 0\n#rack1 ADEIRST\n`,
+        status: 404,
+        contentType: "application/json",
+        body: JSON.stringify({
+          error: {
+            code: "cross_tables_not_found",
+            message: "Cross-Tables game or GCG file was not found",
+          },
+        }),
       });
       return;
     }
-    if (
-      url.pathname === "/annotated.php" &&
-      url.searchParams.get("u") === "5241"
-    ) {
-      await route.fulfill({
-        status: 200,
-        contentType: "text/html",
-        headers: { "access-control-allow-origin": "*" },
-        body: '<a href="https://www.cross-tables.com/annotated/selfgcg/52/anno5241.gcg">Download .gcg game file</a>',
-      });
-      return;
-    }
-    await route.fallback();
+    // Real Cross-Tables GCG files usually omit #lexicon; the page declares it.
+    const gcg = `#character-encoding UTF-8\n#player1 A Alice\n#player2 B Bob\n>A: ADEIRST 8D DISRATE +70 70\n>B: ABCDEFG - 0 0\n#rack1 ADEIRST\n`;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        document: parseGcg(gcg),
+        encoding: "UTF-8",
+        sourceSha256: "e2e-cross-tables-hash",
+        lexicon: {
+          status: "exact",
+          source: "source_page",
+          hint: "NWL23",
+          id: "nwl23",
+        },
+        gameId: 5241,
+        sourceUrl: body.url,
+        gcgUrl:
+          "https://www.cross-tables.com/annotated/selfgcg/52/anno5241.gcg",
+        gcgBase64: Buffer.from(gcg).toString("base64"),
+      }),
+    });
   });
   await page.route("**/api/v1/imports/gcg", async (route) => {
     const text = route.request().postData() ?? "";
@@ -624,7 +639,7 @@ test("selects CSW24 for static generation and preserves its identity", async ({
   await expect(page.locator(".lexicon-chip")).toContainText("CSW24");
   await expect(
     settings.getByLabel("Analysis").locator('option[value="deep"]'),
-  ).toHaveAttribute("disabled", "");
+  ).not.toHaveAttribute("disabled", "");
   await expect(page.getByText(CSW_COPYRIGHT)).toBeVisible();
   await page.getByRole("button", { name: "Close settings" }).click();
   await page.getByRole("button", { name: "Analyze position" }).click();
@@ -689,7 +704,89 @@ test.describe("Cross-Tables browser mediation", () => {
     await page.getByRole("button", { name: "Import public GCG" }).click();
     await expect(page.getByRole("button", { name: "H8 A" })).toBeVisible();
     await expect(page.getByText("2 history records")).toBeVisible();
+    await expect(page.getByRole("alertdialog")).toHaveCount(0);
+    await expect(page.locator(".lexicon-chip")).toContainText("NWL2023");
   });
+
+  test("reports a missing Cross-Tables game clearly", async ({ page }) => {
+    await clearDraft(page);
+    await mockSessionApi(page);
+    await page.goto("/");
+
+    await expect(page.getByText("Session ready")).toBeVisible();
+    await page.getByRole("button", { name: "Open settings" }).click();
+    await page
+      .getByLabel("Cross-Tables game URL")
+      .fill("https://www.cross-tables.com/annotated.php?u=9");
+    await page.getByRole("button", { name: "Import public GCG" }).click();
+    await expect(
+      page.getByText(
+        /Cross-Tables import failed · Cross-Tables game or GCG file was not found/,
+      ),
+    ).toBeVisible();
+  });
+});
+
+test("asks which dictionary to use for a GCG without #lexicon", async ({
+  page,
+}) => {
+  await clearDraft(page);
+  await mockSessionApi(page);
+  await page.goto("/");
+
+  await expect(page.getByText("Session ready")).toBeVisible();
+  await page.getByRole("button", { name: "Open settings" }).click();
+  await page
+    .locator('input[type="file"][accept="text/plain,.gcg,.txt"]')
+    .setInputFiles({
+      name: "nolexicon.gcg",
+      mimeType: "text/plain",
+      buffer: Buffer.from(
+        `#character-encoding UTF-8\n#player1 A Alice\n#player2 B Bob\n>A: ADEIRST 8D DISRATE +70 70\n`,
+      ),
+    });
+  const prompt = page.getByRole("alertdialog", { name: "Which dictionary?" });
+  await expect(prompt).toBeVisible();
+  await prompt.getByRole("button", { name: "CSW24" }).click();
+  await expect(prompt).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "H8 A" })).toBeVisible();
+  await expect(page.locator(".lexicon-chip")).toContainText("CSW24");
+});
+
+test("board squares stay square and fit narrow phones", async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 700 });
+  await clearDraft(page);
+  await mockSessionApi(page);
+  await page.goto("/");
+  await expect(page.getByText("Session ready")).toBeVisible();
+  await enterRack(page, "WM");
+  await page.locator(".rack-tile").first().click();
+  await page.locator(".board-cell").nth(112).click();
+  await page.locator(".rack-tile").nth(1).click();
+  await page.locator(".board-cell").nth(113).click();
+  const metrics = await page.evaluate(() => {
+    const cells = [...document.querySelectorAll(".board-cell")].map((cell) =>
+      cell.getBoundingClientRect(),
+    );
+    const board = document.querySelector(".board")!.getBoundingClientRect();
+    return {
+      scrollWidth: document.documentElement.scrollWidth,
+      viewport: window.innerWidth,
+      boardRight: board.right,
+      sizes: [
+        ...new Set(
+          cells.map(
+            (rect) => `${rect.width.toFixed(2)}x${rect.height.toFixed(2)}`,
+          ),
+        ),
+      ],
+      square: cells.every((rect) => Math.abs(rect.width - rect.height) < 0.5),
+    };
+  });
+  expect(metrics.scrollWidth).toBeLessThanOrEqual(metrics.viewport);
+  expect(metrics.boardRight).toBeLessThanOrEqual(metrics.viewport);
+  expect(metrics.sizes).toHaveLength(1);
+  expect(metrics.square).toBe(true);
 });
 
 test("recent scenarios switch without losing local positions", async ({

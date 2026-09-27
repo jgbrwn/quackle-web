@@ -201,7 +201,7 @@ public:
            const QString &gaddagPath, const QString &lexiconId,
            const QString &workerKind, const QString &workerBuild)
         : dataDir_(dataDir), lexiconId_(lexiconId), workerKind_(workerKind),
-          workerBuild_(workerBuild), supportsDeepAnalysis_(lexiconId == "nwl23") {
+          workerBuild_(workerBuild), supportsDeepAnalysis_(lexiconId == "nwl23" || lexiconId == "csw24") {
         if (!isSupportedLexiconId(lexiconId_)) {
             throw WorkerError("unsupported_lexicon",
                               QString("worker lexicon '%1' is not enabled").arg(lexiconId_));

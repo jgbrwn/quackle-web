@@ -172,8 +172,10 @@ def build(args: argparse.Namespace) -> dict:
                 "raw_retained": False,
                 "copyright_notice": entry["copyright"]["notice"],
             },
-            "strategy_compatibility": "csw24-static",
-            "analysis_capability": "static_only",
+            # Matches upstream Quackle's lookup: strategy/csw superleaves plus
+            # the default English worths/bogowin tables.
+            "strategy_compatibility": "quackle-upstream-csw" if args.lexicon_id.startswith("csw") else "static",
+            "analysis_capability": "deep" if args.lexicon_id.startswith("csw") else "static_only",
             "created_at": args.created_at,
         }
         (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

@@ -108,3 +108,49 @@ export function parseCrossTablesGcgUrl(
   url.hostname = "www.cross-tables.com";
   return url.toString();
 }
+
+export interface CrossTablesPageInfo {
+  gcgUrl: string;
+  dictionary: string | null;
+}
+
+/** Derived download path Cross-Tables uses for self-annotated games. */
+export function derivedCrossTablesGcgUrl(gameId: number): string {
+  return parseCrossTablesGcgUrl(
+    `https://www.cross-tables.com/annotated/selfgcg/${Math.floor(gameId / 100)}/anno${gameId}.gcg`,
+    gameId,
+  );
+}
+
+/**
+ * Extract the GCG download link and declared dictionary from an annotated
+ * game page. The HTML is treated as untrusted text: only allowlisted GCG paths
+ * for the requested game id are accepted, and the dictionary is a short token.
+ */
+export function parseCrossTablesPage(
+  html: string,
+  link: CrossTablesLink,
+): CrossTablesPageInfo {
+  let gcgUrl: string | null = null;
+  for (const match of html.matchAll(
+    /href\s*=\s*(['"])([^'"<>]{1,300}?\.gcg)\1/gi,
+  )) {
+    try {
+      gcgUrl = parseCrossTablesGcgUrl(
+        new URL(match[2]!, link.url).toString(),
+        link.gameId,
+      );
+      break;
+    } catch {
+      // Ignore links outside the allowlisted download path.
+    }
+  }
+  const dictionary =
+    html
+      .match(/Dictionary:\s*<b>\s*([A-Za-z0-9_-]{2,16})\s*<\/b>/i)?.[1]
+      ?.toUpperCase() ?? null;
+  return {
+    gcgUrl: gcgUrl ?? derivedCrossTablesGcgUrl(link.gameId),
+    dictionary,
+  };
+}

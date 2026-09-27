@@ -15,6 +15,50 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Meta" }
+  /imports/gcg:
+    post:
+      operationId: validateGcgImport
+      description: Validate uploaded GCG bytes (text/plain or application/octet-stream, at most 256 KiB).
+      responses:
+        "200":
+          {
+            description: "Parsed document, encoding, sourceSha256, and lexicon resolution.",
+          }
+        "413": { description: Upload exceeds the GCG limit. }
+        "422": { description: GCG could not be parsed. }
+  /imports/cross-tables:
+    post:
+      operationId: importCrossTablesGame
+      description: >-
+        Fetch one allowlisted Cross-Tables annotated game and its matching GCG
+        download server-side (Cross-Tables sends no CORS headers), then validate
+        it like an upload. The page's declared dictionary is used when the GCG
+        has no #lexicon pragma.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  {
+                    type: string,
+                    description: "https://www.cross-tables.com/annotated.php?u=<numeric id>",
+                  }
+      responses:
+        "200":
+          {
+            description: "Validated document plus gameId, sourceUrl, gcgUrl, gcgBase64, and lexicon {status, source, hint, id}.",
+          }
+        "404": { description: Game or GCG file not found. }
+        "422":
+          {
+            description: URL is not an allowlisted annotated-game link,
+            or GCG is invalid.,
+          }
+        "502": { description: Cross-Tables could not be reached. }
   /sessions:
     post:
       operationId: createSession

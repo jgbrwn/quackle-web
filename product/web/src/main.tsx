@@ -1,13 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { render } from "preact";
-import {
-  parseCrossTablesGcgUrl,
-  parseCrossTablesUrl,
-} from "../../shared/cross-tables";
+import { parseCrossTablesUrl } from "../../shared/cross-tables";
 import {
   classicPremiumAt,
   decodeGcgBytes,
   exportGcg,
+  GcgParseError,
   parseGcg,
   replayGcgHistory,
   resolveLexiconHint,
@@ -179,7 +177,7 @@ const LEXICON_DETAILS: Record<LexiconId, LexiconDetails> = {
     displayName: "CSW24",
     copyright:
       "Collins Offical Scrabble™ Wordlist 2024, Published under license with Collins, an imprint of HarperCollins Publishers Limited",
-    deepAnalysis: false,
+    deepAnalysis: true,
   },
 };
 
@@ -620,42 +618,32 @@ function draftStateFromUnknown(value: unknown): SessionStateDraft {
   };
   return stateForCells(cellsFromState(value), base);
 }
-async function readBoundedResponse(
+interface GcgValidationResponse {
+  document?: unknown;
+  sourceSha256?: unknown;
+  encoding?: unknown;
+  lexicon?: {
+    id?: unknown;
+    status?: unknown;
+    hint?: unknown;
+    source?: unknown;
+  };
+}
+
+class GcgImportError extends Error {}
+
+async function apiErrorMessage(
   response: Response,
-  maximum: number,
-): Promise<ArrayBuffer> {
-  const declaredLength = response.headers.get("content-length");
-  if (
-    declaredLength &&
-    /^\d+$/.test(declaredLength) &&
-    Number(declaredLength) > maximum
-  )
-    throw new Error("response_too_large");
-  if (!response.body) {
-    const bytes = await response.arrayBuffer();
-    if (bytes.byteLength > maximum) throw new Error("response_too_large");
-    return bytes;
+  fallback: string,
+): Promise<string> {
+  try {
+    const body = (await response.json()) as { error?: unknown };
+    if (isObject(body.error) && typeof body.error.message === "string")
+      return body.error.message.slice(0, 160);
+  } catch {
+    // Fall through to the generic message.
   }
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  for (;;) {
-    const next = await reader.read();
-    if (next.done) break;
-    size += next.value.byteLength;
-    if (size > maximum) {
-      await reader.cancel();
-      throw new Error("response_too_large");
-    }
-    chunks.push(next.value);
-  }
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes.buffer;
+  return fallback;
 }
 
 function App() {
@@ -702,6 +690,16 @@ function App() {
   >("horizontal");
   const [activeCellIndex, setActiveCellIndex] = useState(112);
   const [blankPickerIndex, setBlankPickerIndex] = useState<number | null>(null);
+  const [lexiconPrompt, setLexiconPrompt] = useState<
+    ((choice: LexiconId | null) => void) | null
+  >(null);
+  const askLexicon = () =>
+    new Promise<LexiconId | null>((resolve) => {
+      setLexiconPrompt(() => (choice: LexiconId | null) => {
+        setLexiconPrompt(null);
+        resolve(choice);
+      });
+    });
   const [movesOpen, setMovesOpen] = useState(true);
   const activeCellRef = useRef<HTMLButtonElement | null>(null);
   const dragRef = useRef<{
@@ -1779,6 +1777,7 @@ function App() {
     bytes: ArrayBuffer,
     filename: string,
     sourceUrl?: string,
+    prevalidated?: GcgValidationResponse,
   ): Promise<boolean> => {
     try {
       const decoded = decodeGcgBytes(bytes);
@@ -1788,34 +1787,44 @@ function App() {
       );
       if (localLexiconResolution === "unsupported")
         throw new Error("unsupported_lexicon");
-      const validationResponse = await fetch(apiUrl("/api/v1/imports/gcg"), {
-        method: "POST",
-        headers: { "content-type": "application/octet-stream" },
-        body: bytes,
-      });
-      if (!validationResponse.ok)
-        throw new Error("server_gcg_validation_failed");
-      const validation = (await validationResponse.json()) as {
-        document?: unknown;
-        sourceSha256?: unknown;
-        encoding?: unknown;
-        lexicon?: { id?: unknown; status?: unknown };
-      };
+      let validation = prevalidated;
+      if (!validation) {
+        const validationResponse = await fetch(apiUrl("/api/v1/imports/gcg"), {
+          method: "POST",
+          headers: { "content-type": "application/octet-stream" },
+          body: bytes,
+        });
+        if (validationResponse.status === 422)
+          throw new GcgImportError(
+            await apiErrorMessage(
+              validationResponse,
+              "the file is not valid GCG",
+            ),
+          );
+        if (!validationResponse.ok)
+          throw new Error("server_gcg_validation_failed");
+        validation = (await validationResponse.json()) as GcgValidationResponse;
+      }
       if (!isObject(validation) || !isObject(validation.document))
         throw new Error("server_gcg_validation_failed");
       const parsed = validation.document as unknown as GcgImportResult;
-      const lexiconResolution = resolveLexiconHint(parsed.lexiconHint);
+      // A GCG #lexicon line wins; otherwise accept the dictionary the source
+      // page declared (e.g. Cross-Tables "Dictionary: NWL23").
+      const lexiconInfo = (validation as GcgValidationResponse).lexicon;
+      const sourceHint =
+        isObject(lexiconInfo) && typeof lexiconInfo.hint === "string"
+          ? lexiconInfo.hint
+          : null;
+      const effectiveHint = parsed.lexiconHint ?? sourceHint;
+      const lexiconResolution = resolveLexiconHint(effectiveHint);
       if (lexiconResolution === "unsupported")
         throw new Error("unsupported_lexicon");
-      const importedLexicon: LexiconId =
+      let importedLexicon: LexiconId =
         lexiconResolution === "csw24" ? "csw24" : "nwl23";
-      if (
-        lexiconResolution === "missing" &&
-        !window.confirm(
-          "This GCG file does not identify a dictionary. Import it explicitly as NWL2023?",
-        )
-      ) {
-        throw new Error("lexicon_not_confirmed");
+      if (lexiconResolution === "missing") {
+        const choice = await askLexicon();
+        if (!choice) throw new Error("lexicon_not_confirmed");
+        importedLexicon = choice;
       }
       if (parsed.finalRack.length > 7) throw new Error("rack_too_large");
       const importedAt = new Date().toISOString();
@@ -1844,7 +1853,9 @@ function App() {
             description: parsed.description || undefined,
             players: parsed.players,
             finalPlayer: parsed.finalPlayer ?? undefined,
-            lexiconHint: parsed.lexiconHint,
+            lexiconHint:
+              effectiveHint ??
+              (importedLexicon === "csw24" ? "CSW24" : "NWL23"),
             sourceSha256:
               typeof validation.sourceSha256 === "string"
                 ? validation.sourceSha256
@@ -1864,22 +1875,36 @@ function App() {
         filename: filename.slice(0, 128),
         ...(sourceUrl ? { sourceUrl } : {}),
       });
+      const lexiconLabel = importedLexicon === "csw24" ? "CSW24" : "NWL2023";
       setStatus(
         parsed.warnings.length > 0
-          ? `Imported GCG · ${parsed.warnings[0]}`
-          : `Imported GCG · ${typeof validation.encoding === "string" ? validation.encoding : decoded.encoding}`,
+          ? `Imported GCG · ${lexiconLabel} · ${parsed.warnings[0]}`
+          : `Imported GCG · ${lexiconLabel} · ${parsed.history.length} events`,
       );
       return true;
     } catch (error) {
-      if (error instanceof Error && error.message === "unsupported_lexicon") {
-        setStatus("GCG import blocked · dictionary is not enabled");
+      if (error instanceof GcgImportError) {
+        setStatus(`GCG import failed · ${error.message}`);
+      } else if (error instanceof GcgParseError) {
+        setStatus(`GCG import failed · ${error.message}`);
+      } else if (error instanceof Error && error.message === "rack_too_large") {
+        setStatus("GCG import failed · final rack has more than 7 tiles");
+      } else if (
+        error instanceof Error &&
+        error.message === "unsupported_lexicon"
+      ) {
+        setStatus(
+          "GCG import blocked · dictionary is not enabled (NWL2023 and CSW24 are supported)",
+        );
       } else if (
         error instanceof Error &&
         error.message === "lexicon_not_confirmed"
       ) {
         setStatus("GCG import cancelled · dictionary mapping required");
       } else {
-        setStatus("GCG import failed · check the file and dictionary identity");
+        setStatus(
+          `GCG import failed · ${error instanceof TypeError ? "network unavailable" : "the file could not be validated"}`,
+        );
       }
       return false;
     }
@@ -1924,59 +1949,38 @@ function App() {
       return;
     }
     setCrossTablesBusy(true);
+    setStatus(`Fetching Cross-Tables game ${link.gameId}…`);
     try {
-      const pageResponse = await fetch(link.url, {
-        mode: "cors",
-        credentials: "omit",
-        redirect: "error",
+      const response = await fetch(apiUrl("/api/v1/imports/cross-tables"), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url: link.url }),
       });
-      if (!pageResponse.ok) throw new Error("page_unavailable");
-      const pageBytes = await readBoundedResponse(
-        pageResponse,
-        MAX_IMPORT_BYTES,
-      );
-      const pageText = new TextDecoder("utf-8", { fatal: false }).decode(
-        pageBytes,
-      );
-      const page = new DOMParser().parseFromString(pageText, "text/html");
-      let gcgUrl: string | null = null;
-      for (const anchor of [...page.querySelectorAll("a[href]")]) {
-        try {
-          const href = (anchor as HTMLAnchorElement).getAttribute("href");
-          if (!href) continue;
-          gcgUrl = parseCrossTablesGcgUrl(
-            new URL(href, link.url).toString(),
-            link.gameId,
-          );
-          break;
-        } catch {
-          // Ignore non-GCG links and continue through the bounded page.
-        }
+      if (!response.ok) {
+        setStatus(
+          `Cross-Tables import failed · ${await apiErrorMessage(response, "service unavailable")} · you can download the .gcg and use Import GCG`,
+        );
+        return;
       }
-      if (!gcgUrl) {
-        const derived = `https://www.cross-tables.com/annotated/selfgcg/${Math.floor(link.gameId / 100)}/anno${link.gameId}.gcg`;
-        try {
-          gcgUrl = parseCrossTablesGcgUrl(derived, link.gameId);
-        } catch {
-          throw new Error("gcg_link_missing");
-        }
-      }
-      const gcgResponse = await fetch(gcgUrl, {
-        mode: "cors",
-        credentials: "omit",
-        redirect: "error",
-      });
-      if (!gcgResponse.ok) throw new Error("gcg_unavailable");
-      const gcgBytes = await readBoundedResponse(gcgResponse, MAX_IMPORT_BYTES);
+      const result = (await response.json()) as GcgValidationResponse & {
+        gcgBase64?: unknown;
+      };
+      if (typeof result.gcgBase64 !== "string")
+        throw new Error("invalid_response");
+      const binary = atob(result.gcgBase64);
+      const gcgBytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1)
+        gcgBytes[index] = binary.charCodeAt(index);
       const imported = await importGcgBytes(
-        gcgBytes,
+        gcgBytes.buffer,
         `cross-tables-${link.gameId}.gcg`,
         link.url,
+        result,
       );
       if (imported) setCrossTablesUrl("");
     } catch (error) {
       setStatus(
-        `Cross-Tables fetch unavailable · ${error instanceof Error ? error.message : "browser fetch blocked"} · open the link, download .gcg, then use Import GCG`,
+        `Cross-Tables import failed · ${error instanceof TypeError ? "network unavailable" : "unexpected response"} · you can download the .gcg and use Import GCG`,
       );
     } finally {
       setCrossTablesBusy(false);
@@ -2182,7 +2186,7 @@ function App() {
     setDraftState((previous) => ({ ...previous, lexiconId }));
     setScenarioDirty(true);
     clearAnalysisResults();
-    if (lexiconId === "csw24") setAnalysisMode("fast");
+    if (!LEXICON_DETAILS[lexiconId].deepAnalysis) setAnalysisMode("fast");
     setStatus(
       `${LEXICON_DETAILS[lexiconId].displayName} selected · save or analyze to apply`,
     );
@@ -2820,7 +2824,9 @@ function App() {
                 <option value="fast">Fast static moves</option>
                 <option value="deep" disabled={!lexicon.deepAnalysis}>
                   Deep analysis job
-                  {!lexicon.deepAnalysis ? " (NWL23 only)" : ""}
+                  {!lexicon.deepAnalysis
+                    ? " (unavailable for this lexicon)"
+                    : ""}
                 </option>
               </select>
             </label>
@@ -2838,8 +2844,8 @@ function App() {
             </label>
             {draftState.lexiconId === "csw24" && (
               <p class="engine-note" role="status">
-                CSW24 supports dictionary validation and static move generation.
-                Deep strategy analysis is intentionally unavailable.
+                CSW24 deep analysis uses Quackle's upstream CSW superleaves with
+                its default English worths and win-probability tables.
               </p>
             )}
             <label>
@@ -3005,9 +3011,9 @@ function App() {
               </button>
             </div>
             <p class="scenario-note">
-              Only validated HTTPS Cross-Tables annotated-game links are opened.
-              If browser CORS blocks the GCG download, use Open link, download
-              the file, then Import GCG.
+              Paste a Cross-Tables annotated-game link (annotated.php?u=…). The
+              game and its declared dictionary are fetched and validated by the
+              service; nothing else on the page is used.
             </p>
             <p class="disclosure">
               <strong>{lexicon.copyright}</strong>
@@ -3145,6 +3151,57 @@ function App() {
                   {letter}
                 </button>
               ))}
+            </div>
+          </section>
+        </div>
+      )}
+      {lexiconPrompt && (
+        <div
+          class="drawer-backdrop choice-backdrop"
+          role="presentation"
+          onClick={() => lexiconPrompt(null)}
+        >
+          <section
+            class="blank-picker"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="lexicon-prompt-title"
+            aria-describedby="lexicon-prompt-body"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div class="drawer-heading">
+              <div>
+                <span class="eyebrow">GCG IMPORT</span>
+                <h2 id="lexicon-prompt-title">Which dictionary?</h2>
+              </div>
+              <button
+                class="icon-button"
+                type="button"
+                onClick={() => lexiconPrompt(null)}
+                aria-label="Cancel import"
+              >
+                ×
+              </button>
+            </div>
+            <p id="lexicon-prompt-body" class="about-lede">
+              This GCG file does not name its dictionary. Choose the one the
+              game was played with so words are validated correctly.
+            </p>
+            <div class="data-actions">
+              <button
+                class="primary-button"
+                type="button"
+                onClick={() => lexiconPrompt("nwl23")}
+              >
+                NWL2023
+              </button>
+              <button
+                class="secondary-button"
+                type="button"
+                onClick={() => lexiconPrompt("csw24")}
+              >
+                CSW24
+              </button>
             </div>
           </section>
         </div>

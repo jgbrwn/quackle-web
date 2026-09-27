@@ -112,7 +112,7 @@ class NativeWorkerProtocolTests(unittest.TestCase):
         self.assertEqual(payload["lexicon"]["id"], LEXICON_ID)
         self.assertEqual(payload["lexicon"]["hash"], "7f0e9ef8fde8d6ef986acb7de33b1c98" if LEXICON_ID == "csw24" else "155a50a1a6508393601760e6971987ed")
         self.assertIn("generate_moves", payload["operations"])
-        if WORKER_KIND == "deep" and LEXICON_ID == "nwl23":
+        if WORKER_KIND == "deep":
             self.assertIn("analyze", payload["operations"])
         else:
             self.assertNotIn("analyze", payload["operations"])
@@ -193,7 +193,7 @@ class NativeWorkerProtocolTests(unittest.TestCase):
             self.assertIn("unacceptable_word", [item["code"] for item in data["issues"]])
 
 
-    @unittest.skipUnless(WORKER_KIND == "deep" and LEXICON_ID == "nwl23", "analyze requires a deep NWL23 worker")
+    @unittest.skipUnless(WORKER_KIND == "deep", "analyze requires a deep worker")
     def test_analyze_is_terminal_and_seed_reproducible(self) -> None:
         request = {
             "protocol": 1,
