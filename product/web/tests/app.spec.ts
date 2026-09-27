@@ -347,12 +347,32 @@ async function mockSessionApi(
             {
               action: "place",
               position: "8D",
+              row: 7,
+              col: 3,
+              horizontal: true,
               word: "DISRATE",
+              tiles: "DISRATE",
               score: 70,
               equity: 72.45531,
               is_bingo: true,
             },
+            {
+              action: "place",
+              position: "8G",
+              row: 7,
+              col: 6,
+              horizontal: true,
+              word: "STAIRED",
+              tiles: "STAIRED",
+              score: 64,
+              equity: 66.1,
+              is_bingo: true,
+            },
           ],
+          boardWarnings:
+            session.state.metadata?.format === "gcg"
+              ? [{ code: "unacceptable_word", word: "QZ" }]
+              : [],
           count: 1,
           elapsedMs: 4,
         }),
@@ -725,6 +745,61 @@ test.describe("Cross-Tables browser mediation", () => {
       ),
     ).toBeVisible();
   });
+});
+
+test("replays a game with both player names, the mover's rack, and turn analysis", async ({
+  page,
+}) => {
+  await clearDraft(page);
+  await mockSessionApi(page);
+  await page.goto("/");
+
+  await expect(page.getByText("Session ready")).toBeVisible();
+  await page.getByRole("button", { name: "Open settings" }).click();
+  await page
+    .locator('input[type="file"][accept="text/plain,.gcg,.txt"]')
+    .setInputFiles({
+      name: "turns.gcg",
+      mimeType: "text/plain",
+      buffer: Buffer.from(
+        `#character-encoding UTF-8\n#player1 Samuel_Kaplan Samuel Kaplan\n#player2 Verna Verna Berg\n#lexicon NWL23\n>Samuel_Kaplan: AEMNNUU -NUU +0 0\n>Verna: ADEIRST 8G STAIRED +68 68\n#note Could have played DISRATE.\n>Samuel_Kaplan: AEEGOPT -OPT +0 0\n#rack2 ADEI\n`,
+      ),
+    });
+  // The success message must survive the session connection.
+  await expect(page.getByText(/Imported 3 records · NWL2023/)).toBeVisible();
+  await page.getByRole("button", { name: "Close settings" }).click();
+  await expect(page.getByText(/Imported 3 records · NWL2023/)).toBeVisible();
+  await expect(page.locator(".score-card").first()).toContainText(
+    "Samuel Kaplan",
+  );
+  await expect(page.locator(".score-card").nth(1)).toContainText("Verna Berg");
+
+  await page.getByRole("button", { name: "Replay game" }).click();
+  await page.getByRole("button", { name: "Next" }).click();
+  await expect(page.getByText("Record 1 of 3")).toBeVisible();
+  await expect(page.getByText("VERNA BERG'S RACK")).toBeVisible();
+  await expect(page.locator(".score-card.active")).toContainText("Verna Berg");
+  await expect(page.locator(".rack .rack-tile")).toHaveCount(7);
+  await expect(page.locator(".replay-event")).toContainText(
+    "8G STAIRED +68 · 68",
+  );
+
+  await page.getByRole("button", { name: "Analyze this turn" }).click();
+  await expect(page.getByText("Analysis complete")).toBeVisible();
+  await expect(page.locator(".move-row.played")).toContainText("STAIRED");
+  await expect(page.getByText(/The move played ranks #2/)).toBeVisible();
+  await expect(page.getByText(/not in NWL2023: QZ/)).toBeVisible();
+
+  await page.getByRole("button", { name: "Next" }).click();
+  await expect(page.locator(".replay-note")).toContainText(
+    "Could have played DISRATE.",
+  );
+  await expect(page.getByText("SAMUEL KAPLAN'S RACK")).toBeVisible();
+  await expect(page.locator(".move-row")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Return to final" }).click();
+  await expect(page.getByRole("button", { name: "Replay game" })).toBeVisible();
+  await expect(page.locator(".rack .rack-tile")).toHaveCount(4);
 });
 
 test("asks which dictionary to use for a GCG without #lexicon", async ({

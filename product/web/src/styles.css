@@ -150,7 +150,7 @@ select:focus-visible {
   justify-content: flex-end;
 }
 .replay-panel {
-  margin-bottom: 14px;
+  margin: 12px 0 0;
   padding: 11px 12px;
   border: 1px solid #cddbd0;
   border-radius: 12px;
@@ -171,18 +171,105 @@ select:focus-visible {
   font-size: 13px;
 }
 .replay-controls {
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   margin-top: 9px;
+  gap: 6px;
 }
 .replay-controls .secondary-button {
-  min-height: 36px;
+  min-height: 40px;
   padding: 0 10px;
-  font-size: 11px;
+  font-size: 13px;
+}
+.replay-controls .step-button {
+  flex: 0 0 auto;
+  min-width: 42px;
+}
+.replay-slider {
+  flex: 1;
+  min-width: 0;
+  accent-color: #28664f;
 }
 .replay-event {
-  margin: 8px 0 0;
-  color: #5e7568;
+  margin: 9px 0 0;
+  color: #4f6459;
+  font-size: 12px;
+  line-height: 1.45;
+  display: grid;
+  gap: 4px;
+}
+.replay-event p {
+  margin: 0;
+}
+.replay-event strong {
+  color: #1f3d31;
+  margin-right: 4px;
+}
+.replay-label {
+  display: inline-block;
+  min-width: 50px;
+  margin-right: 6px;
+  color: #7b8c86;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.replay-note {
+  max-height: 7.3em;
+  overflow-y: auto;
+  padding: 6px 8px;
+  border-left: 3px solid #b9d0bf;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.6);
+  color: #4c5f55;
   font-size: 11px;
+  white-space: pre-wrap;
+}
+.replay-rack {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: #5a4a22;
+  background: #f8e7b5;
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.replay-played {
+  font-weight: 650;
+  color: #285d49;
+}
+.replay-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 6px;
+}
+.score-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.move-row.played {
+  box-shadow: inset 3px 0 0 #e08a3c;
+}
+.played-badge {
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: #e08a3c;
+  color: #fff;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  vertical-align: 2px;
+}
+.played-summary {
+  margin: 4px 12px 0;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: #fff4d9;
+  color: #6e5b37;
+  font-size: 11px;
+  line-height: 1.4;
 }
 .online-state {
   color: #3a7d61;
@@ -1035,4 +1122,21 @@ select:focus-visible {
     animation-iteration-count: 1 !important;
     scroll-behavior: auto !important;
   }
+}
+.score-card {
+  min-width: 0;
+}
+.board-cell:disabled {
+  opacity: 1;
+}
+.rack-tile:disabled {
+  opacity: 1;
+}
+.board-cell.occupied.last-move {
+  background: #fbd98d;
+  box-shadow: inset 0 0 0 2px #e08a3c;
+}
+.replay-partial {
+  color: #8a6a2a;
+  font-size: 11px;
 }

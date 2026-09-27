@@ -121,6 +121,20 @@ export interface GcgReplayFrame {
   currentPlayer: string | null;
   turn: { number: number; scorelessTurns: number };
   event: GcgHistoryEntry | null;
+  /** Squares newly covered by `event` (empty for non-placements or a removed phony). */
+  placed: Array<{ row: number; col: number }>;
+}
+
+/** Records at which a player made a decision (a turn) and whose rack is known. */
+export function isDecisionRecord(
+  entry: GcgHistoryEntry | undefined,
+): entry is Extract<GcgHistoryEntry, { kind: "place" | "pass" | "exchange" }> {
+  return (
+    entry !== undefined &&
+    (entry.kind === "place" ||
+      entry.kind === "pass" ||
+      entry.kind === "exchange")
+  );
 }
 
 export interface GcgExportInput {
@@ -1073,6 +1087,7 @@ export function replayGcgHistory(
     computedScore: number;
   } | null = null;
 
+  let placed: Array<{ row: number; col: number }> = [];
   const snapshot = (
     historyIndex: number,
     event: GcgHistoryEntry | null,
@@ -1093,10 +1108,12 @@ export function replayGcgHistory(
       scorelessTurns: Math.min(6, scorelessTurns),
     },
     event,
+    placed,
   });
 
   frames.push(snapshot(0, null));
   for (const [historyIndex, entry] of history.entries()) {
+    placed = [];
     if (entry.kind === "place") {
       const replay = replayPlace(
         board,
@@ -1106,6 +1123,10 @@ export function replayGcgHistory(
         entry.tiles,
         [],
       );
+      placed = replay.placedOffsets.map((offset) => ({
+        row: entry.row + (entry.direction === "vertical" ? offset : 0),
+        col: entry.col + (entry.direction === "horizontal" ? offset : 0),
+      }));
       scores.set(
         entry.player,
         (scores.get(entry.player) ?? 0) + replay.computedScore,

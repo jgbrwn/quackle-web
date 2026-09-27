@@ -6,12 +6,14 @@ import {
   decodeGcgBytes,
   exportGcg,
   GcgParseError,
+  isDecisionRecord,
   parseGcg,
   replayGcgHistory,
   resolveLexiconHint,
   type GcgHistoryEntry,
   type GcgImportResult,
   type GcgPlayer,
+  type GcgReplayFrame,
 } from "../../shared/gcg";
 import {
   getScenario,
@@ -91,7 +93,7 @@ type AnalysisJobResponse = {
       | "interrupted";
     progressSeq: number;
     progress: { fraction?: number; elapsedMs?: number } | null;
-    result: { moves?: Move[] } | null;
+    result: { moves?: Move[]; board_warnings?: unknown } | null;
     error: { code?: string; message?: string; retryable?: boolean } | null;
   };
 };
@@ -214,7 +216,17 @@ type SessionStateDraft = {
     sourceUrl?: string;
     importedAt?: string;
     forkedFrom?: { sourceSessionId: string; sourceRevision: number };
+    /** Replay cursor: number of history records applied. Absent = editable final position. */
+    replayCursor?: number;
+    /** Final (post-game) rack/scores/turn so leaving replay restores them exactly. */
+    finalPosition?: FinalPositionSnapshot;
   };
+};
+
+type FinalPositionSnapshot = {
+  rack: string;
+  scores: { onTurn: number; opponent: number };
+  turn: { number: number; scorelessTurns: number };
 };
 
 type PositionExport = {
@@ -376,16 +388,170 @@ function scenarioTimeLabel(timestamp: string): string {
   return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
-function replayEventLabel(event: GcgHistoryEntry): string {
-  if (event.kind === "place")
-    return `${event.player} · ${event.tiles} · ${event.computedScore ?? event.score ?? 0} points`;
-  if (event.kind === "pass") return `${event.player} · pass`;
-  if (event.kind === "exchange") return `${event.player} · exchange`;
+function finalPositionFromUnknown(
+  value: unknown,
+): FinalPositionSnapshot | undefined {
+  if (
+    !isObject(value) ||
+    typeof value.rack !== "string" ||
+    !/^[A-Z?]{0,7}$/.test(value.rack)
+  )
+    return undefined;
+  const scores = isObject(value.scores) ? value.scores : {};
+  const turn = isObject(value.turn) ? value.turn : {};
+  const integer = (candidate: unknown, fallback: number) =>
+    typeof candidate === "number" &&
+    Number.isInteger(candidate) &&
+    candidate >= 0
+      ? candidate
+      : fallback;
+  return {
+    rack: value.rack,
+    scores: {
+      onTurn: integer(scores.onTurn, 0),
+      opponent: integer(scores.opponent, 0),
+    },
+    turn: {
+      number: Math.max(1, integer(turn.number, 1)),
+      scorelessTurns: integer(turn.scorelessTurns, 0),
+    },
+  };
+}
+
+function gcgCoordinate(
+  row: number,
+  col: number,
+  direction: "horizontal" | "vertical",
+): string {
+  const letter = String.fromCharCode(65 + col);
+  return direction === "horizontal"
+    ? `${row + 1}${letter}`
+    : `${letter}${row + 1}`;
+}
+
+/** Full word of a GCG placement, resolving play-through dots from the board. */
+function placementWord(
+  entry: Extract<GcgHistoryEntry, { kind: "place" }>,
+  board: GcgReplayFrame["board"],
+): string {
+  const letters = new Map(
+    board.map((cell) => [
+      `${cell.row}:${cell.col}`,
+      cell.blank ? cell.letter.toLowerCase() : cell.letter,
+    ]),
+  );
+  return [...entry.tiles]
+    .map((token, offset) => {
+      if (token !== ".") return token;
+      const row = entry.row + (entry.direction === "vertical" ? offset : 0);
+      const col = entry.col + (entry.direction === "horizontal" ? offset : 0);
+      return letters.get(`${row}:${col}`) ?? "?";
+    })
+    .join("");
+}
+
+/** GCG-style description such as "8D JOUAL +40 · 40". */
+function describeRecord(
+  event: GcgHistoryEntry,
+  board: GcgReplayFrame["board"] | null,
+): string {
+  const total = event.total !== undefined ? ` · ${event.total}` : "";
+  if (event.kind === "place") {
+    const word = board ? placementWord(event, board) : event.tiles;
+    const score = event.score ?? event.computedScore ?? 0;
+    return `${gcgCoordinate(event.row, event.col, event.direction)} ${word} +${score}${total}${event.challenged ? " (withdrawn)" : ""}`;
+  }
+  if (event.kind === "pass") return `Pass +0${total}`;
+  if (event.kind === "exchange")
+    return `Exchange ${event.tiles ?? (event.blindCount ? `${event.blindCount} tiles` : "")} +0${total}`.replace(
+      "  ",
+      " ",
+    );
   if (event.kind === "challenge")
-    return `${event.player} · ${event.challengeKind === "phony" ? "phony challenge" : `score adjustment ${event.adjustment ?? 0}`}`;
-  if (event.kind === "time")
-    return `${event.player} · time adjustment ${event.score ?? 0}`;
-  return `${event.player} · end bonus ${event.score ?? 0}`;
+    return event.challengeKind === "phony"
+      ? `Phony challenged off ${event.score ?? ""}${total}`
+      : `Challenge bonus ${event.adjustment !== undefined && event.adjustment >= 0 ? "+" : ""}${event.adjustment ?? 0}${total}`;
+  if (event.kind === "time") return `Time penalty ${event.score ?? 0}${total}`;
+  return `End of game (${event.unusedTiles}) ${event.score !== undefined && event.score >= 0 ? "+" : ""}${event.score ?? 0}${total}`;
+}
+
+function sortedLetters(value: string): string {
+  return [...value.toUpperCase()].sort().join("");
+}
+
+/** Whether an engine candidate is the move actually played at a history record. */
+function candidateMatchesRecord(
+  move: Move,
+  record: GcgHistoryEntry,
+  board: GcgReplayFrame["board"],
+): boolean {
+  if (record.kind === "pass") return move.action === "pass";
+  if (record.kind === "exchange")
+    return (
+      move.action === "exchange" &&
+      (!record.tiles ||
+        sortedLetters(move.tiles ?? "") === sortedLetters(record.tiles))
+    );
+  if (record.kind !== "place" || move.action !== "place") return false;
+  if (
+    move.row !== record.row ||
+    move.col !== record.col ||
+    (move.horizontal !== false) !== (record.direction === "horizontal")
+  )
+    return false;
+  const word = placementWord(record, board).toUpperCase();
+  return (move.word ?? "").toUpperCase() === word;
+}
+
+type ReplayPosition = SessionStateDraft["position"];
+
+/** Position at a replay cursor: the board after `index` records with the next mover's rack. */
+function replayPositionAt(
+  frames: GcgReplayFrame[],
+  history: GcgHistoryEntry[],
+  players: GcgPlayer[],
+  index: number,
+  final: FinalPositionSnapshot,
+): ReplayPosition {
+  const frame = frames[index]!;
+  const board = {
+    id: "classic15",
+    cells: frame.board.map((cell) => ({
+      row: cell.row,
+      col: cell.col,
+      letter: cell.letter,
+      blank: cell.blank,
+    })),
+  };
+  if (index >= frames.length - 1)
+    return {
+      board,
+      rack: final.rack,
+      scores: final.scores,
+      turn: final.turn,
+      unseen: { mode: "derive" },
+    };
+  const decision = history[index];
+  const mover = isDecisionRecord(decision)
+    ? decision.player
+    : frame.currentPlayer;
+  const other = players.find(
+    (player) => player.abbreviation !== mover,
+  )?.abbreviation;
+  const rack =
+    isDecisionRecord(decision) && /^[A-Z?]{0,7}$/.test(decision.rack)
+      ? decision.rack
+      : "";
+  return {
+    board,
+    rack,
+    scores: {
+      onTurn: Math.max(0, mover ? (frame.scores[mover] ?? 0) : 0),
+      opponent: Math.max(0, other ? (frame.scores[other] ?? 0) : 0),
+    },
+    turn: frame.turn,
+    unseen: { mode: "derive" },
+  };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -613,6 +779,13 @@ function draftStateFromUnknown(value: unknown): SessionStateDraft {
               ? metadata.importedAt
               : undefined,
           forkedFrom,
+          replayCursor:
+            typeof metadata.replayCursor === "number" &&
+            Number.isInteger(metadata.replayCursor) &&
+            metadata.replayCursor >= 0
+              ? metadata.replayCursor
+              : undefined,
+          finalPosition: finalPositionFromUnknown(metadata.finalPosition),
         }
       : undefined,
   };
@@ -631,6 +804,34 @@ interface GcgValidationResponse {
 }
 
 class GcgImportError extends Error {}
+
+function warningWords(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [
+    ...new Set(
+      value.flatMap((item) =>
+        isObject(item) && typeof item.word === "string" ? [item.word] : [],
+      ),
+    ),
+  ].slice(0, 12);
+}
+
+async function analysisErrorMessage(response: Response): Promise<string> {
+  try {
+    const body = (await response.json()) as { error?: unknown };
+    const error = isObject(body.error) ? body.error : {};
+    const details = isObject(error.details) ? error.details : {};
+    const first = Array.isArray(details.issues)
+      ? details.issues.find(isObject)
+      : undefined;
+    if (first && typeof first.message === "string")
+      return first.message.slice(0, 160);
+    if (typeof error.message === "string") return error.message.slice(0, 160);
+  } catch {
+    // Fall through.
+  }
+  return "the engine rejected this position";
+}
 
 async function apiErrorMessage(
   response: Response,
@@ -682,7 +883,9 @@ function App() {
   const [scenarioDirty, setScenarioDirty] = useState(false);
   const [scenariosOpen, setScenariosOpen] = useState(false);
   const [scenarioBusy, setScenarioBusy] = useState(false);
-  const [replayIndex, setReplayIndex] = useState<number | null>(null);
+  const [boardWarnings, setBoardWarnings] = useState<string[]>([]);
+  const pendingOpenStatusRef = useRef<string | null>(null);
+  const draftStateRef = useRef<SessionStateDraft | null>(null);
   const [entryMode, setEntryMode] = useState<"tap" | "type">("tap");
   const [rackEditMode, setRackEditMode] = useState(false);
   const [boardDirection, setBoardDirection] = useState<
@@ -735,6 +938,7 @@ function App() {
   const importInputRef = useRef<HTMLInputElement>(null);
   const importGcgInputRef = useRef<HTMLInputElement>(null);
 
+  draftStateRef.current = draftState;
   const cells = useMemo(() => cellsFromState(draftState), [draftState]);
   const rack = draftState.position.rack;
   const selectedTile =
@@ -762,6 +966,7 @@ function App() {
     draftState.metadata?.format,
     draftState.metadata?.players,
   ]);
+  const replayIndex = draftState.metadata?.replayCursor ?? null;
   const activeReplayIndex =
     replayIndex === null || replayFrames.length === 0
       ? null
@@ -782,22 +987,71 @@ function App() {
     [cells, replayFrame],
   );
   const previewCells = useMemo(() => {
-    if (isReplaying || selectedMoveIndex === null || !moves[selectedMoveIndex])
+    if (selectedMoveIndex === null || !moves[selectedMoveIndex])
       return visibleCells;
     return previewCellsForMove(visibleCells, moves[selectedMoveIndex]);
-  }, [isReplaying, moves, selectedMoveIndex, visibleCells]);
+  }, [moves, selectedMoveIndex, visibleCells]);
   const visibleFilledCount = Object.keys(visibleCells).length;
-  const visibleScores = useMemo(() => {
-    if (!replayFrame) return draftState.position.scores;
-    const current = replayFrame.currentPlayer;
-    const opponent = draftState.metadata?.players?.find(
-      (player) => player.abbreviation !== current,
-    )?.abbreviation;
-    return {
-      onTurn: current ? (replayFrame.scores[current] ?? 0) : 0,
-      opponent: opponent ? (replayFrame.scores[opponent] ?? 0) : 0,
-    };
-  }, [draftState.metadata?.players, draftState.position.scores, replayFrame]);
+  const gamePlayers = useMemo(
+    () =>
+      replayFrames.length > 0 && draftState.metadata?.players?.length === 2
+        ? [...draftState.metadata.players].sort(
+            (left, right) => left.id - right.id,
+          )
+        : null,
+    [draftState.metadata?.players, replayFrames.length],
+  );
+  const playerName = (abbreviation: string | null | undefined) =>
+    draftState.metadata?.players
+      ?.find((player) => player.abbreviation === abbreviation)
+      ?.name.replace(/_/g, " ") ??
+    abbreviation?.replace(/_/g, " ") ??
+    "Unknown";
+  const finalFrame =
+    replayFrames.length > 0 ? replayFrames[replayFrames.length - 1] : null;
+  // The decision (turn) about to be made at the replay cursor, if any.
+  const replayDecision =
+    isReplaying &&
+    activeReplayIndex !== null &&
+    isDecisionRecord(draftState.history[activeReplayIndex])
+      ? draftState.history[activeReplayIndex]
+      : null;
+  const replayMover = isReplaying
+    ? (replayDecision?.player ?? replayFrame?.currentPlayer ?? null)
+    : (draftState.metadata?.finalPlayer ?? null);
+  const gameOver =
+    !isReplaying &&
+    finalFrame !== null &&
+    draftState.history.some((entry) => entry.kind === "end-bonus");
+  const scoreboard = gamePlayers
+    ? gamePlayers.map((player) => ({
+        name: player.name.replace(/_/g, " "),
+        abbreviation: player.abbreviation,
+        score:
+          (isReplaying ? replayFrame?.scores : finalFrame?.scores)?.[
+            player.abbreviation
+          ] ?? 0,
+        active: !gameOver && player.abbreviation === replayMover,
+      }))
+    : null;
+  const visibleScores = draftState.position.scores;
+  const playedMoveIndex = useMemo(() => {
+    if (!replayDecision || !replayFrame) return null;
+    const index = moves.findIndex((move) =>
+      candidateMatchesRecord(
+        move,
+        replayDecision,
+        replayFrames[(activeReplayIndex ?? 0) + 1]?.board ?? replayFrame.board,
+      ),
+    );
+    return index >= 0 ? index : null;
+  }, [activeReplayIndex, moves, replayDecision, replayFrame, replayFrames]);
+  const lastMoveCells = useMemo(() => {
+    const frame = isReplaying ? replayFrame : finalFrame;
+    return new Set(
+      (frame?.placed ?? []).map((cell) => cell.row * SIZE + cell.col),
+    );
+  }, [finalFrame, isReplaying, replayFrame]);
   const visibleTurn = replayFrame?.turn ?? draftState.position.turn;
 
   useEffect(() => {
@@ -958,10 +1212,12 @@ function App() {
         }
 
         if (cancelled) return;
-        setDraftState(restoredState);
+        // Do not clobber edits the user made while the session was connecting.
+        const editedWhileConnecting = draftStateRef.current !== localState;
+        if (!editedWhileConnecting) setDraftState(restoredState);
         setSessionId(data.session.id);
         setRevision(nextRevision);
-        setScenarioDirty(nextDirty);
+        setScenarioDirty(editedWhileConnecting || nextDirty);
         setSessionReady(true);
         setConnectionState("online");
         if (sessionWasRecreated) {
@@ -972,9 +1228,12 @@ function App() {
           scenario.revision !== data.session.revision
         ) {
           setStatus("Session changed · local copy preserved");
+        } else if (pendingOpenStatusRef.current) {
+          setStatus(pendingOpenStatusRef.current);
         } else {
           setStatus(nextDirty ? "Recovered local draft" : "Session ready");
         }
+        pendingOpenStatusRef.current = null;
         const updatedScenario: ScenarioRecord = {
           ...scenario,
           sessionId: data.session.id,
@@ -988,6 +1247,7 @@ function App() {
         setScenarioList(await listScenarios().catch(() => [updatedScenario]));
       } catch (error) {
         if (cancelled) return;
+        pendingOpenStatusRef.current = null;
         setSessionReady(false);
         setConnectionState("offline");
         setDraftState(localState);
@@ -1047,25 +1307,110 @@ function App() {
       .catch(() => undefined);
   }, [activeLocalId, draftState, hydrated, revision, scenarioDirty, sessionId]);
 
-  const startReplay = () => {
-    if (replayFrames.length === 0) return;
+  const moveReplayCursor = (index: number | null, message?: string) => {
+    if (replayFrames.length === 0 || !draftState.metadata?.players) return;
+    stopAnalysisForScenarioSwitch();
+    const players = draftState.metadata.players;
+    setDraftState((previous) => {
+      const metadata = previous.metadata ?? {};
+      // Capture the editable final position the first time replay starts.
+      const final: FinalPositionSnapshot =
+        metadata.finalPosition ??
+        (metadata.replayCursor === undefined
+          ? {
+              rack: previous.position.rack,
+              scores: previous.position.scores,
+              turn: previous.position.turn,
+            }
+          : {
+              rack: "",
+              scores: previous.position.scores,
+              turn: previous.position.turn,
+            });
+      const last = replayFrames.length - 1;
+      const bounded =
+        index === null ? null : Math.max(0, Math.min(index, last));
+      const position = replayPositionAt(
+        replayFrames,
+        previous.history,
+        players,
+        bounded ?? last,
+        final,
+      );
+      const { replayCursor: _previousCursor, ...rest } = metadata;
+      return {
+        ...previous,
+        position,
+        metadata: {
+          ...rest,
+          finalPosition: final,
+          ...(bounded === null ? {} : { replayCursor: bounded }),
+        },
+      };
+    });
     setSelectedRackIndex(null);
-    setReplayIndex(0);
-    setStatus("Replay started · read-only history");
+    setScenarioDirty(true);
+    clearAnalysisResults();
+    if (message) setStatus(message);
   };
 
-  const setReplayCursor = (index: number) => {
-    if (replayFrames.length === 0) return;
-    setSelectedRackIndex(null);
-    setReplayIndex(Math.max(0, Math.min(index, replayFrames.length - 1)));
-  };
+  useEffect(() => {
+    if (!isReplaying) return;
+    const handler = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.closest(
+          "input, select, textarea, [role=dialog], [role=alertdialog]",
+        ) ||
+          target.closest(".board"))
+      )
+        return;
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        moveReplayCursor((activeReplayIndex ?? 0) + 1);
+      } else if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        moveReplayCursor((activeReplayIndex ?? 0) - 1);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  });
 
-  const returnToFinal = () => {
-    setReplayIndex(null);
-    setStatus("Returned to final position");
+  const startReplay = () =>
+    moveReplayCursor(
+      0,
+      "Replay started · step through the game or analyze any turn",
+    );
+  const setReplayCursor = (index: number) => moveReplayCursor(index);
+  const returnToFinal = () =>
+    moveReplayCursor(null, "Returned to final position");
+
+  const branchFromReplay = () => {
+    if (!isReplaying || activeReplayIndex === null) return;
+    const title = draftState.metadata?.title || "Imported game";
+    const branched: SessionStateDraft = {
+      ...draftState,
+      history: [],
+      metadata: {
+        description: `Branched from ${title} after record ${activeReplayIndex}.`,
+        lexiconHint: draftState.metadata?.lexiconHint,
+        sourceUrl: draftState.metadata?.sourceUrl,
+      },
+    };
+    pendingOpenStatusRef.current =
+      "Editable copy created · the imported game is unchanged";
+    void createScenario(
+      "new",
+      `${title.slice(0, 40)} · record ${activeReplayIndex}`,
+      branched,
+      { kind: "new" },
+    );
   };
 
   const clearAnalysisResults = () => {
+    setBoardWarnings([]);
     setMoves([]);
     setSelectedMoveIndex(null);
     setRetryAvailable(false);
@@ -1074,11 +1419,27 @@ function App() {
   const markPositionEdited = (
     message: string,
     update: (previous: SessionStateDraft) => SessionStateDraft,
+    rackOnly = false,
   ) => {
     if (isReplaying) return;
     setDraftState((previous) => {
       const next = update(previous);
-      if (previous.metadata?.format === "gcg" && previous.history.length > 0) {
+      if (
+        rackOnly &&
+        previous.metadata?.format === "gcg" &&
+        previous.history.length > 0
+      ) {
+        // A rack change does not alter the recorded board history.
+        const final = next.metadata?.finalPosition;
+        if (final)
+          next.metadata = {
+            ...next.metadata,
+            finalPosition: { ...final, rack: next.position.rack },
+          };
+      } else if (
+        previous.metadata?.format === "gcg" &&
+        previous.history.length > 0
+      ) {
         next.history = [];
         next.metadata = {
           ...next.metadata,
@@ -1212,20 +1573,25 @@ function App() {
           rack: `${previous.position.rack}${letter}`,
         },
       }),
+      true,
     );
   };
 
   const removeRackTile = (index: number) => {
     if (isReplaying) return;
-    markPositionEdited("Removed a tile from the rack", (previous) => ({
-      ...previous,
-      position: {
-        ...previous.position,
-        rack: [...previous.position.rack]
-          .filter((_, tileIndex) => tileIndex !== index)
-          .join(""),
-      },
-    }));
+    markPositionEdited(
+      "Removed a tile from the rack",
+      (previous) => ({
+        ...previous,
+        position: {
+          ...previous.position,
+          rack: [...previous.position.rack]
+            .filter((_, tileIndex) => tileIndex !== index)
+            .join(""),
+        },
+      }),
+      true,
+    );
     setSelectedRackIndex(null);
   };
 
@@ -1244,10 +1610,14 @@ function App() {
         letters[index],
       ];
     }
-    markPositionEdited("Rack shuffled", (previous) => ({
-      ...previous,
-      position: { ...previous.position, rack: letters.join("") },
-    }));
+    markPositionEdited(
+      "Rack shuffled",
+      (previous) => ({
+        ...previous,
+        position: { ...previous.position, rack: letters.join("") },
+      }),
+      true,
+    );
     setSelectedRackIndex(null);
   };
 
@@ -1422,7 +1792,6 @@ function App() {
       setSessionId(opened.sessionId);
       setRevision(opened.revision);
       setScenarioDirty(opened.dirty);
-      setReplayIndex(null);
       setSelectedRackIndex(null);
       setSelectedPaletteTile(null);
       setSelectedMoveIndex(null);
@@ -1828,8 +2197,17 @@ function App() {
       }
       if (parsed.finalRack.length > 7) throw new Error("rack_too_large");
       const importedAt = new Date().toISOString();
+      const matchup =
+        parsed.players.length === 2
+          ? [...parsed.players]
+              .sort((left, right) => left.id - right.id)
+              .map((player) => player.name.replace(/_/g, " "))
+              .join(" vs ")
+          : "";
       const title =
-        parsed.title.trim() || `Imported GCG · ${filename.slice(0, 40)}`;
+        parsed.title.trim() ||
+        matchup ||
+        `Imported GCG · ${filename.slice(0, 40)}`;
       const state: SessionStateDraft = stateForCells(
         Object.fromEntries(
           parsed.board.map((cell) => [
@@ -1866,21 +2244,27 @@ function App() {
                 : decoded.encoding,
             sourceUrl,
             importedAt,
+            finalPosition: {
+              rack: parsed.finalRack,
+              scores: parsed.scores,
+              turn: parsed.turn,
+            },
           },
         },
       );
+      const lexiconLabel = importedLexicon === "csw24" ? "CSW24" : "NWL2023";
+      const importedMessage =
+        parsed.warnings.length > 0
+          ? `Imported GCG · ${lexiconLabel} · ${parsed.warnings[0]}`
+          : `Imported ${parsed.history.length} records · ${lexiconLabel} · use Replay game to step through and analyze`;
+      pendingOpenStatusRef.current = importedMessage;
       await createScenario("imported", title, state, {
         kind: "imported",
         format: "gcg",
         filename: filename.slice(0, 128),
         ...(sourceUrl ? { sourceUrl } : {}),
       });
-      const lexiconLabel = importedLexicon === "csw24" ? "CSW24" : "NWL2023";
-      setStatus(
-        parsed.warnings.length > 0
-          ? `Imported GCG · ${lexiconLabel} · ${parsed.warnings[0]}`
-          : `Imported GCG · ${lexiconLabel} · ${parsed.history.length} events`,
-      );
+      setStatus(importedMessage);
       return true;
     } catch (error) {
       if (error instanceof GcgImportError) {
@@ -2018,6 +2402,7 @@ function App() {
         );
       } else if (job.status === "succeeded") {
         setMoves(job.result?.moves ?? []);
+        setBoardWarnings(warningWords(job.result?.board_warnings));
         setSelectedMoveIndex(null);
         setStatus("Deep analysis complete");
         return;
@@ -2026,6 +2411,8 @@ function App() {
       } else if (job.status === "cancelled") {
         throw new Error("job_cancelled");
       } else {
+        if (job.error?.code === "invalid_position" && job.error.message)
+          throw new GcgImportError(job.error.message);
         throw new Error("job_failed");
       }
       await new Promise<void>((resolve, reject) => {
@@ -2137,10 +2524,13 @@ function App() {
           ) {
             throw new Error("engine_wake_failed");
           }
+          if (response.status === 422)
+            throw new GcgImportError(await analysisErrorMessage(response));
           throw new Error(`HTTP ${response.status}`);
         }
         const result = await response.json();
         setMoves(Array.isArray(result?.moves) ? result.moves : []);
+        setBoardWarnings(warningWords(result?.boardWarnings));
         setSelectedMoveIndex(null);
         setStatus("Analysis complete");
       }
@@ -2163,6 +2553,9 @@ function App() {
         setStatus("Deep analysis interrupted · retry");
       } else if (error instanceof Error && error.message === "job_cancelled") {
         setStatus("Analysis cancelled");
+      } else if (error instanceof GcgImportError) {
+        setRetryAvailable(false);
+        setStatus(`Cannot analyze · ${error.message}`);
       } else {
         setStatus(
           analysisMode === "deep"
@@ -2282,84 +2675,6 @@ function App() {
           </div>
         </section>
 
-        {replayFrames.length > 1 && (
-          <section class="replay-panel" aria-label="Game replay">
-            <div class="replay-heading">
-              <div>
-                <span class="eyebrow">GAME REPLAY</span>
-                <strong>
-                  {isReplaying
-                    ? `Record ${activeReplayIndex} of ${draftState.history.length}`
-                    : "Final position"}
-                </strong>
-              </div>
-              {!isReplaying && (
-                <button
-                  class="secondary-button"
-                  type="button"
-                  onClick={startReplay}
-                >
-                  Replay game
-                </button>
-              )}
-            </div>
-            {isReplaying && (
-              <>
-                <div class="replay-controls">
-                  <button
-                    class="secondary-button"
-                    type="button"
-                    onClick={() => setReplayCursor(0)}
-                    disabled={activeReplayIndex === 0}
-                  >
-                    First
-                  </button>
-                  <button
-                    class="secondary-button"
-                    type="button"
-                    onClick={() =>
-                      setReplayCursor((activeReplayIndex ?? 0) - 1)
-                    }
-                    disabled={activeReplayIndex === 0}
-                  >
-                    Previous
-                  </button>
-                  <button
-                    class="secondary-button"
-                    type="button"
-                    onClick={() =>
-                      setReplayCursor((activeReplayIndex ?? 0) + 1)
-                    }
-                    disabled={activeReplayIndex === replayFrames.length - 1}
-                  >
-                    Next
-                  </button>
-                  <button
-                    class="secondary-button"
-                    type="button"
-                    onClick={() => setReplayCursor(replayFrames.length - 1)}
-                    disabled={activeReplayIndex === replayFrames.length - 1}
-                  >
-                    Final record
-                  </button>
-                  <button
-                    class="text-button"
-                    type="button"
-                    onClick={returnToFinal}
-                  >
-                    Return to final
-                  </button>
-                </div>
-                <p class="replay-event" aria-live="polite">
-                  {replayFrame?.event
-                    ? replayEventLabel(replayFrame.event)
-                    : "Initial position"}
-                </p>
-              </>
-            )}
-          </section>
-        )}
-
         {draftState.metadata?.forkedFrom && !isReplaying && (
           <p class="fork-note" role="status">
             Forked from shared scenario revision{" "}
@@ -2371,20 +2686,41 @@ function App() {
         <div class="analysis-layout">
           <section class="board-column" aria-label="Position editor">
             <div class="score-row">
-              <div class="score-card active">
-                <span>{isReplaying ? "On turn" : "You"}</span>
-                <strong>{visibleScores.onTurn}</strong>
-                <small>
-                  {isReplaying
-                    ? (replayFrame?.currentPlayer ?? "unknown")
-                    : "on turn"}
-                </small>
-              </div>
-              <div class="score-card">
-                <span>Opponent</span>
-                <strong>{visibleScores.opponent}</strong>
-                <small>{isReplaying ? "other player" : "unknown rack"}</small>
-              </div>
+              {scoreboard ? (
+                scoreboard.map((player) => (
+                  <div
+                    class={`score-card ${player.active ? "active" : ""}`}
+                    key={player.abbreviation}
+                  >
+                    <span class="score-name">{player.name}</span>
+                    <strong>{player.score}</strong>
+                    <small>
+                      {player.active
+                        ? isReplaying
+                          ? replayDecision
+                            ? "to play"
+                            : "on turn"
+                          : "on turn"
+                        : gameOver
+                          ? "final"
+                          : "\u00a0"}
+                    </small>
+                  </div>
+                ))
+              ) : (
+                <>
+                  <div class="score-card active">
+                    <span>You</span>
+                    <strong>{visibleScores.onTurn}</strong>
+                    <small>on turn</small>
+                  </div>
+                  <div class="score-card">
+                    <span>Opponent</span>
+                    <strong>{visibleScores.opponent}</strong>
+                    <small>unknown rack</small>
+                  </div>
+                </>
+              )}
             </div>
             <div class="board-wrap">
               <div class="board-labels top-labels" aria-hidden="true">
@@ -2426,7 +2762,7 @@ function App() {
                           activeCellIndex === index ? activeCellRef : undefined
                         }
                         type="button"
-                        class={`board-cell ${premium} ${cell ? "occupied" : ""} ${isPreview ? "preview-tile" : ""} ${activeCellIndex === index ? "active-cell" : ""} ${cell?.blank ? "blank-tile" : ""}`}
+                        class={`board-cell ${premium} ${cell ? "occupied" : ""} ${isPreview ? "preview-tile" : ""} ${activeCellIndex === index && !isReplaying ? "active-cell" : ""} ${cell?.blank ? "blank-tile" : ""} ${!isPreview && lastMoveCells.has(index) ? "last-move" : ""}`}
                         onClick={() => placeTile(index)}
                         onFocus={() => setActiveCellIndex(index)}
                         onKeyDown={(event) => handleBoardKeyDown(event, index)}
@@ -2457,40 +2793,227 @@ function App() {
                 </div>
               </div>
             </div>
+            {replayFrames.length > 1 && (
+              <section class="replay-panel" aria-label="Game replay">
+                <div class="replay-heading">
+                  <div>
+                    <span class="eyebrow">GAME REPLAY</span>
+                    <strong>
+                      {isReplaying
+                        ? `Record ${activeReplayIndex} of ${draftState.history.length}`
+                        : gameOver
+                          ? "Final position · game over"
+                          : "Final position"}
+                    </strong>
+                  </div>
+                  {!isReplaying && (
+                    <button
+                      class="secondary-button"
+                      type="button"
+                      onClick={startReplay}
+                    >
+                      Replay game
+                    </button>
+                  )}
+                </div>
+                {isReplaying && (
+                  <>
+                    <div class="replay-controls">
+                      <button
+                        class="secondary-button step-button"
+                        type="button"
+                        aria-label="First"
+                        title="First record"
+                        onClick={() => setReplayCursor(0)}
+                        disabled={activeReplayIndex === 0}
+                      >
+                        ⏮
+                      </button>
+                      <button
+                        class="secondary-button step-button"
+                        type="button"
+                        aria-label="Previous"
+                        title="Previous record (←)"
+                        onClick={() =>
+                          setReplayCursor((activeReplayIndex ?? 0) - 1)
+                        }
+                        disabled={activeReplayIndex === 0}
+                      >
+                        ◀
+                      </button>
+                      <input
+                        class="replay-slider"
+                        type="range"
+                        min={0}
+                        max={replayFrames.length - 1}
+                        value={activeReplayIndex ?? 0}
+                        aria-label="Replay position"
+                        onInput={(event) =>
+                          setReplayCursor(Number(event.currentTarget.value))
+                        }
+                      />
+                      <button
+                        class="secondary-button step-button"
+                        type="button"
+                        aria-label="Next"
+                        title="Next record (→)"
+                        onClick={() =>
+                          setReplayCursor((activeReplayIndex ?? 0) + 1)
+                        }
+                        disabled={activeReplayIndex === replayFrames.length - 1}
+                      >
+                        ▶
+                      </button>
+                      <button
+                        class="secondary-button step-button"
+                        type="button"
+                        aria-label="Final record"
+                        title="Final record"
+                        onClick={() => setReplayCursor(replayFrames.length - 1)}
+                        disabled={activeReplayIndex === replayFrames.length - 1}
+                      >
+                        ⏭
+                      </button>
+                    </div>
+                    <div class="replay-event" aria-live="polite">
+                      {replayFrame?.event ? (
+                        <p>
+                          <span class="replay-label">Last</span>
+                          <strong>
+                            {playerName(replayFrame.event.player)}
+                          </strong>{" "}
+                          {describeRecord(replayFrame.event, replayFrame.board)}
+                        </p>
+                      ) : (
+                        <p>
+                          <span class="replay-label">Start</span>Empty board ·
+                          no moves yet
+                        </p>
+                      )}
+                      {replayFrame?.event?.note && (
+                        <p class="replay-note">{replayFrame.event.note}</p>
+                      )}
+                      {replayDecision ? (
+                        <>
+                          <p>
+                            <span class="replay-label">To play</span>
+                            <strong>
+                              {playerName(replayDecision.player)}
+                            </strong>{" "}
+                            holds{" "}
+                            <span class="replay-rack">
+                              {replayDecision.rack || "?"}
+                            </span>{" "}
+                            · played{" "}
+                            <span class="replay-played">
+                              {describeRecord(
+                                replayDecision,
+                                replayFrames[(activeReplayIndex ?? 0) + 1]
+                                  ?.board ?? null,
+                              )}
+                            </span>
+                          </p>
+                          {replayDecision.rack.length < 7 &&
+                            (replayFrame?.board.length ?? 0) + 7 < 100 && (
+                              <p class="replay-partial">
+                                Only {replayDecision.rack.length} of this
+                                player's tiles were recorded (annotators often
+                                record just the tiles they know or played).
+                                Analysis uses these tiles only.
+                              </p>
+                            )}
+                        </>
+                      ) : activeReplayIndex !== null &&
+                        activeReplayIndex < draftState.history.length ? (
+                        <p>
+                          <span class="replay-label">Next</span>
+                          {playerName(
+                            draftState.history[activeReplayIndex]?.player,
+                          )}{" "}
+                          ·{" "}
+                          {describeRecord(
+                            draftState.history[activeReplayIndex]!,
+                            replayFrames[activeReplayIndex + 1]?.board ?? null,
+                          )}
+                        </p>
+                      ) : (
+                        <p>
+                          <span class="replay-label">End</span>
+                          {gamePlayers
+                            ? gamePlayers
+                                .map(
+                                  (player) =>
+                                    `${player.name.replace(/_/g, " ")} ${replayFrame?.scores[player.abbreviation] ?? 0}`,
+                                )
+                                .join(" · ")
+                            : "Final record"}
+                        </p>
+                      )}
+                    </div>
+                    <div class="replay-actions">
+                      <button
+                        class="text-button"
+                        type="button"
+                        onClick={branchFromReplay}
+                      >
+                        Edit a copy from here
+                      </button>
+                      <button
+                        class="text-button"
+                        type="button"
+                        onClick={returnToFinal}
+                      >
+                        Return to final
+                      </button>
+                    </div>
+                  </>
+                )}
+              </section>
+            )}
             <div class="rack-panel">
               <div class="rack-heading">
                 <span class="eyebrow">
-                  {isReplaying ? "FINAL RACK SNAPSHOT" : "YOUR RACK"}
+                  {isReplaying
+                    ? replayDecision
+                      ? `${playerName(replayDecision.player).toUpperCase()}'S RACK`
+                      : activeReplayIndex === replayFrames.length - 1
+                        ? "FINAL RACK SNAPSHOT"
+                        : "NO RACK AT THIS RECORD"
+                    : scoreboard && draftState.metadata?.finalPlayer
+                      ? `${playerName(draftState.metadata.finalPlayer).toUpperCase()}'S RACK`
+                      : "YOUR RACK"}
                 </span>
-                <div class="rack-actions">
-                  <button
-                    type="button"
-                    class="text-button"
-                    onClick={shuffleRack}
-                    disabled={isReplaying || rack.length < 2}
-                  >
-                    Shuffle
-                  </button>
-                  <button
-                    type="button"
-                    class="text-button"
-                    onClick={() => {
-                      setRackEditMode((open) => !open);
-                      setSelectedRackIndex(null);
-                    }}
-                    disabled={isReplaying}
-                  >
-                    {rackEditMode ? "Done" : "Edit rack"}
-                  </button>
-                  <button
-                    type="button"
-                    class="text-button"
-                    onClick={() => setSelectedRackIndex(null)}
-                    disabled={isReplaying}
-                  >
-                    Clear selection
-                  </button>
-                </div>
+                {!isReplaying && (
+                  <div class="rack-actions">
+                    <button
+                      type="button"
+                      class="text-button"
+                      onClick={shuffleRack}
+                      disabled={isReplaying || rack.length < 2}
+                    >
+                      Shuffle
+                    </button>
+                    <button
+                      type="button"
+                      class="text-button"
+                      onClick={() => {
+                        setRackEditMode((open) => !open);
+                        setSelectedRackIndex(null);
+                      }}
+                      disabled={isReplaying}
+                    >
+                      {rackEditMode ? "Done" : "Edit rack"}
+                    </button>
+                    <button
+                      type="button"
+                      class="text-button"
+                      onClick={() => setSelectedRackIndex(null)}
+                      disabled={isReplaying}
+                    >
+                      Clear selection
+                    </button>
+                  </div>
+                )}
               </div>
               <div class="rack" aria-label="Rack">
                 {Array.from(rack).map((letter, index) => (
@@ -2533,66 +3056,76 @@ function App() {
                   <span class="rack-empty">No tiles · use Edit rack</span>
                 )}
               </div>
-              <div class="editor-toolbar" aria-label="Board entry controls">
-                <button
-                  class="mode-button"
-                  type="button"
-                  aria-pressed={entryMode === "tap"}
-                  onClick={() => setEntryMode("tap")}
-                >
-                  Tap to place
-                </button>
-                <button
-                  class="mode-button"
-                  type="button"
-                  aria-pressed={entryMode === "type"}
-                  onClick={() => setEntryMode("type")}
-                >
-                  Tile typing
-                </button>
-                <button
-                  class="mode-button"
-                  type="button"
-                  onClick={() =>
-                    setBoardDirection((direction) =>
-                      direction === "horizontal" ? "vertical" : "horizontal",
-                    )
-                  }
-                >
-                  {boardDirection === "horizontal" ? "Across" : "Down"}
-                </button>
-              </div>
-              <div
-                class="tile-keyboard"
-                aria-label={
-                  rackEditMode ? "Rack tile keyboard" : "Board tile keyboard"
-                }
-              >
-                {TILE_KEYBOARD.map((letter) => (
-                  <button
-                    key={letter}
-                    type="button"
-                    class={`tile-key ${letter === "⌫" ? "wide" : ""}`}
-                    onClick={() => handleTileKeyboard(letter)}
-                    disabled={
-                      isReplaying ||
-                      (rackEditMode && rack.length >= 7 && letter !== "⌫")
-                    }
+              {!isReplaying && (
+                <>
+                  <div class="editor-toolbar" aria-label="Board entry controls">
+                    <button
+                      class="mode-button"
+                      type="button"
+                      aria-pressed={entryMode === "tap"}
+                      onClick={() => setEntryMode("tap")}
+                    >
+                      Tap to place
+                    </button>
+                    <button
+                      class="mode-button"
+                      type="button"
+                      aria-pressed={entryMode === "type"}
+                      onClick={() => setEntryMode("type")}
+                    >
+                      Tile typing
+                    </button>
+                    <button
+                      class="mode-button"
+                      type="button"
+                      onClick={() =>
+                        setBoardDirection((direction) =>
+                          direction === "horizontal"
+                            ? "vertical"
+                            : "horizontal",
+                        )
+                      }
+                    >
+                      {boardDirection === "horizontal" ? "Across" : "Down"}
+                    </button>
+                  </div>
+                  <div
+                    class="tile-keyboard"
                     aria-label={
-                      letter === "⌫"
-                        ? "Delete tile"
-                        : letter === "?"
-                          ? "Blank tile"
-                          : `Tile ${letter}`
+                      rackEditMode
+                        ? "Rack tile keyboard"
+                        : "Board tile keyboard"
                     }
                   >
-                    {letter}
-                  </button>
-                ))}
-              </div>
+                    {TILE_KEYBOARD.map((letter) => (
+                      <button
+                        key={letter}
+                        type="button"
+                        class={`tile-key ${letter === "⌫" ? "wide" : ""}`}
+                        onClick={() => handleTileKeyboard(letter)}
+                        disabled={
+                          isReplaying ||
+                          (rackEditMode && rack.length >= 7 && letter !== "⌫")
+                        }
+                        aria-label={
+                          letter === "⌫"
+                            ? "Delete tile"
+                            : letter === "?"
+                              ? "Blank tile"
+                              : `Tile ${letter}`
+                        }
+                      >
+                        {letter}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
               <p class="hint" aria-live="polite">
                 {isReplaying
-                  ? "Replay is read-only; racks remain the final imported snapshot."
+                  ? replayDecision
+                    ? "History position · analyze to compare Quackle's choices with the move played."
+                    : "History position · this record is not a turn decision."
                   : rackEditMode
                     ? "Tap letters to edit the rack. Tap a rack tile again to remove it."
                     : entryMode === "type"
@@ -2603,25 +3136,36 @@ function App() {
               </p>
             </div>
             <div class="action-row">
-              <button
-                class="secondary-button"
-                type="button"
-                onClick={() =>
-                  markPositionEdited("Board cleared", (previous) =>
-                    stateForCells({}, previous),
-                  )
-                }
-                disabled={isReplaying}
-              >
-                Clear board
-              </button>
+              {!isReplaying && (
+                <button
+                  class="secondary-button"
+                  type="button"
+                  onClick={() =>
+                    markPositionEdited("Board cleared", (previous) =>
+                      stateForCells({}, previous),
+                    )
+                  }
+                >
+                  Clear board
+                </button>
+              )}
               <button
                 class="primary-button"
                 type="button"
                 onClick={() => void analyze()}
-                disabled={analyzing || !sessionReady || isReplaying}
+                disabled={
+                  analyzing ||
+                  !sessionReady ||
+                  (isReplaying && (!replayDecision || !replayDecision.rack))
+                }
               >
-                {isReplaying ? "Replay is read-only" : analysisLabel}
+                {isReplaying &&
+                !analyzing &&
+                (!replayDecision || !replayDecision.rack)
+                  ? "No turn to analyze"
+                  : isReplaying && !analyzing && !retryAvailable && sessionReady
+                    ? "Analyze this turn"
+                    : analysisLabel}
               </button>
               {analyzing && (
                 <button
@@ -2646,6 +3190,13 @@ function App() {
                   Reconnect session
                 </button>
               </div>
+            )}
+            {boardWarnings.length > 0 && (
+              <p class="engine-note" role="status">
+                Board contains {boardWarnings.length === 1 ? "a word" : "words"}{" "}
+                not in {lexicon.displayName}: {boardWarnings.join(", ")}.
+                Quackle analyzes the position anyway.
+              </p>
             )}
             {analysisPhase === "warming" && (
               <p class="engine-note" role="status" aria-live="polite">
@@ -2696,6 +3247,7 @@ function App() {
                     </p>
                   )}
                   {moves.map((move, index) => {
+                    const played = playedMoveIndex === index;
                     const score =
                       typeof move.score === "number" ? move.score : "—";
                     const equity =
@@ -2710,7 +3262,7 @@ function App() {
                           : "Pass";
                     return (
                       <button
-                        class={`move-row ${selectedMoveIndex === index ? "selected" : ""}`}
+                        class={`move-row ${selectedMoveIndex === index ? "selected" : ""} ${played ? "played" : ""}`}
                         type="button"
                         key={`${move.position ?? ""}-${move.word ?? move.action}-${index}`}
                         onClick={() => {
@@ -2723,9 +3275,16 @@ function App() {
                           {String(index + 1).padStart(2, "0")}
                         </span>
                         <span class="move-main">
-                          <strong>{label}</strong>
+                          <strong>
+                            {label}
+                            {played && <span class="played-badge">PLAYED</span>}
+                          </strong>
                           <small>
-                            {move.position ?? move.action}
+                            {move.action === "place"
+                              ? move.horizontal === false
+                                ? "down"
+                                : "across"
+                              : move.action}
                             {move.is_bingo ? " · BINGO" : ""}
                             {move.leave ? ` · leave ${move.leave}` : ""}
                           </small>
@@ -2738,6 +3297,15 @@ function App() {
                     );
                   })}
                 </div>
+                {replayDecision && moves.length > 0 && (
+                  <p class="played-summary" role="status">
+                    {playedMoveIndex === null
+                      ? `Played ${describeRecord(replayDecision, replayFrames[(activeReplayIndex ?? 0) + 1]?.board ?? null)} is not among these ${moves.length} candidates.`
+                      : playedMoveIndex === 0
+                        ? "The move played matches Quackle's top choice."
+                        : `The move played ranks #${playedMoveIndex + 1}${typeof moves[playedMoveIndex]?.equity === "number" && typeof moves[0]?.equity === "number" ? `, ${(moves[0].equity! - moves[playedMoveIndex].equity!).toFixed(1)} equity behind the top choice` : ""}.`}
+                  </p>
+                )}
                 <div class="panel-footer">
                   <span>
                     {analyzing

@@ -413,11 +413,7 @@ public:
     QJsonObject generateMoves(const QJsonObject &payload, quint32 seed) {
         const QJsonObject position = payload.value("position").toObject(payload);
         PositionState state = parsePosition(position);
-        if (!state.issues.isEmpty()) {
-            QJsonObject details;
-            details["issues"] = state.issues;
-            throw WorkerError("invalid_position", "position is not valid", false, details);
-        }
+        const QJsonArray boardWarnings = requireAnalyzable(state);
 
         const QJsonObject options = payload.value("options").toObject();
         const int limit = boundedInt(options, "limit", 1, 100, 20);
@@ -436,6 +432,7 @@ public:
         QJsonObject result;
         result["moves"] = moves;
         result["count"] = moves.size();
+        result["board_warnings"] = boardWarnings;
         return result;
     }
 
@@ -451,11 +448,7 @@ public:
         }
         const QJsonObject position = payload.value("position").toObject(payload);
         PositionState state = parsePosition(position);
-        if (!state.issues.isEmpty()) {
-            QJsonObject details;
-            details["issues"] = state.issues;
-            throw WorkerError("invalid_position", "position is not valid", false, details);
-        }
+        const QJsonArray boardWarnings = requireAnalyzable(state);
 
         const QJsonObject options = payload.value("options").toObject();
         const int limit = boundedInt(options, "limit", 1, 50, 10);
@@ -508,11 +501,32 @@ public:
         result["moves"] = moves;
         result["count"] = moves.size();
         result["strategy"] = "twenty_second_championship";
+        result["board_warnings"] = boardWarnings;
         result["partial"] = false;
         return result;
     }
 
 private:
+    // Quackle itself analyzes positions containing words outside the lexicon
+    // (e.g. an unchallenged phony in an imported game). Structural problems
+    // still block analysis; unacceptable words are returned as warnings.
+    QJsonArray requireAnalyzable(const PositionState &state) const {
+        QJsonArray blocking;
+        QJsonArray warnings;
+        for (const QJsonValue &value : state.issues) {
+            if (value.toObject().value("code").toString() == "unacceptable_word")
+                warnings.append(value);
+            else
+                blocking.append(value);
+        }
+        if (!blocking.isEmpty()) {
+            QJsonObject details;
+            details["issues"] = blocking;
+            throw WorkerError("invalid_position", "position is not valid", false, details);
+        }
+        return warnings;
+    }
+
     void validateBoardWords(const Quackle::GamePosition &position,
                             QJsonArray &issues) {
         QSet<QString> seen;

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Game replay shows both players' names and scores, the mover's recorded rack,
+  the last move and notes, and can analyze any turn, marking the move played.
+- Analysis no longer refuses boards containing an unchallenged phony; the words
+  are reported as warnings, matching upstream Quackle.
+
 - Board cells are sized from one container-query value, stay square when tiles
   are placed, and fit phones down to 320px without horizontal scrolling.
 - Cross-Tables links import through `POST /api/v1/imports/cross-tables`, using

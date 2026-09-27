@@ -160,4 +160,17 @@ describe("Quackle GCG adapter", () => {
     expect(latin1.encoding).toBe("windows-1252");
     expect(latin1.text).toContain("Café");
   });
+
+  it("records the squares each replayed placement covers, and none for a withdrawn phony", () => {
+    const parsed = parseGcg(
+      "#player1 A Alice\n#player2 B Bob\n>A: ADEIRST 8D DISRATE +70 70\n>B: QZXJKVW E7 Q. +11 11\n>B: QZXJKVW -- -11 0\n",
+    );
+    const frames = replayGcgHistory(parsed.players, parsed.history);
+    expect(frames[1]!.placed).toHaveLength(7);
+    expect(frames[1]!.placed[0]).toEqual({ row: 7, col: 3 });
+    expect(frames[2]!.placed).toEqual([{ row: 6, col: 4 }]);
+    expect(frames[3]!.placed).toEqual([]);
+    expect(frames[3]!.board).toHaveLength(7);
+    expect(frames[3]!.currentPlayer).toBe("A");
+  });
 });

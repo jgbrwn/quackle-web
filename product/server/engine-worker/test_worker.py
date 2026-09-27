@@ -192,6 +192,18 @@ class NativeWorkerProtocolTests(unittest.TestCase):
         if LEXICON_ID == "nwl23":
             self.assertIn("unacceptable_word", [item["code"] for item in data["issues"]])
 
+        # Like upstream Quackle, generation still works on a board holding a
+        # word outside the lexicon (an unchallenged phony); it is reported.
+        generate = dict(request, id="generate-phony-board", op="generate_moves")
+        generate["payload"] = {"position": position, "options": {"limit": 3}}
+        result = self.request(generate)[-1]
+        self.assertEqual(result["event"], "result")
+        warnings = result["payload"]["data"]["board_warnings"]
+        if LEXICON_ID == "nwl23":
+            self.assertEqual([item["word"] for item in warnings], ["CH"])
+        else:
+            self.assertEqual(warnings, [])
+
 
     @unittest.skipUnless(WORKER_KIND == "deep", "analyze requires a deep worker")
     def test_analyze_is_terminal_and_seed_reproducible(self) -> None:
