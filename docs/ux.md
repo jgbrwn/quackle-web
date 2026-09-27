@@ -64,6 +64,15 @@ ideas without copying the fixed Qt layout:
   so editing does not summon the native keyboard.
 - About/Legal is available from desktop and mobile and shows engine, lexicon,
   provenance/disclosure, offline behavior, and links to the data tools.
+- Imported GCG/Cross-Tables games replay by history record with both player
+  names/scores, the mover's recorded rack when available, last-move highlighting,
+  and notes. Turns with a usable rack can be analyzed; candidates identify the
+  played move when it appears. Replay state survives reload/reconnect, and
+  “Edit a copy from here” creates a separate editable scenario.
+- The Scenarios drawer currently switches recent browser-local scenarios.
+  Removing a scenario and managing its share links independently are not yet
+  available; keep local scenario removal distinct from revoking a server-side
+  link when designing that workflow.
 
 Reference behaviors were taken from pinned Quackle sources such as
 `quacker/newgame.cpp`, `quacker/graphicalboard.cpp`, `quacker/rackdisplay.cpp`,

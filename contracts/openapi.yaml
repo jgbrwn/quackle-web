@@ -102,6 +102,75 @@ paths:
               schema: { $ref: "#/components/schemas/SessionEnvelope" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422": { $ref: "#/components/responses/Unprocessable" }
+  /sessions/{sessionId}/share:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: listSessionShareLinks
+      description: List safe share-link metadata and undismissed automatic-eviction notices. Never returns bearer tokens or URLs.
+      responses:
+        "200":
+          {
+            description: Active links and notices for this authorized source session.,
+          }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      operationId: createSessionShareLink
+      description: Create an immutable snapshot-fork link. The bearer token is returned only once; store/copy the URL if it must be retained.
+      responses:
+        "201": { description: New link metadata and one-time bearer token. }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          { description: Per-session share snapshot storage limit reached. }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /sessions/{sessionId}/share/{shareId}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - name: shareId
+        in: path
+        required: true
+        schema: { type: string, minLength: 20, maxLength: 128 }
+    delete:
+      operationId: revokeSessionShareLink
+      description: Revoke future redemption and delete the stored snapshot; already-created recipient forks remain independent.
+      responses:
+        "200": { description: Link revoked. }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /sessions/{sessionId}/share-notices/{shareId}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - name: shareId
+        in: path
+        required: true
+        schema: { type: string, minLength: 20, maxLength: 128 }
+    delete:
+      operationId: dismissShareEvictionNotice
+      responses:
+        "200": { description: Notice dismissed. }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /shares/redeem:
+    post:
+      operationId: redeemShareLink
+      description: Redeem a fragment bearer token. Creates a new independent session and sets its HttpOnly capability cookie; never returns source-session authorization.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sourceSessionId, token]
+              properties:
+                sourceSessionId: { type: string, minLength: 20, maxLength: 128 }
+                token: { type: string, minLength: 32, maxLength: 256 }
+              additionalProperties: false
+      responses:
+        "201":
+          {
+            description: New independent fork session; capability is delivered in an HttpOnly cookie.,
+          }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /sessions/{sessionId}/moves/generate:
     parameters:
       - $ref: "#/components/parameters/SessionId"
