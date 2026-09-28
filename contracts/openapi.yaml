@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Quackle Web HTTP API
-  version: 0.2.0
+  version: 0.3.0
   description: Public session and analysis contract for hosted Quackle Web-compatible services.
 servers:
   - url: /api/v1
@@ -15,6 +15,70 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Meta" }
+  /moves/generate:
+    post:
+      operationId: generateMovesStatelessLegacy
+      description: >-
+        Legacy anonymous stateless fast-generation route, using the default
+        fast pool, retained for compatibility. It does not read session state.
+        New browser clients should use the session-scoped generation operation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [protocol, id, op, deadline_ms, seed, payload]
+              properties:
+                protocol: { const: 1 }
+                id: { type: string, minLength: 1, maxLength: 128 }
+                op: { const: generate_moves }
+                deadline_ms: { type: integer, minimum: 1, maximum: 60000 }
+                seed: { type: integer, minimum: 0, maximum: 4294967295 }
+                payload: { type: object }
+              additionalProperties: false
+      responses:
+        "200":
+          description: Versioned native result event.
+          content:
+            application/json:
+              schema:
+                { $ref: "./worker-protocol.schema.json#/$defs/workerEvent" }
+        "400":
+          description: Invalid protocol request; response uses the native worker event envelope.
+          content:
+            application/json:
+              schema:
+                { $ref: "./worker-protocol.schema.json#/$defs/workerEvent" }
+        "405": { description: Method is not allowed. }
+        "413":
+          description: Request exceeds the Go supervisor's configured body limit.
+          content:
+            application/json:
+              schema:
+                { $ref: "./worker-protocol.schema.json#/$defs/workerEvent" }
+        "415": { description: Content-Type must be application/json. }
+        "422":
+          description: Position or engine request is invalid.
+          content:
+            application/json:
+              schema:
+                { $ref: "./worker-protocol.schema.json#/$defs/workerEvent" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503":
+          description: Compute unavailable or admission control unavailable.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { $ref: "./worker-protocol.schema.json#/$defs/workerEvent" }
+                  - { $ref: "#/components/schemas/Error" }
+        "504":
+          description: Native request deadline exceeded.
+          content:
+            application/json:
+              schema:
+                { $ref: "./worker-protocol.schema.json#/$defs/workerEvent" }
   /imports/gcg:
     post:
       operationId: validateGcgImport
@@ -24,8 +88,14 @@ paths:
           {
             description: "Parsed document, encoding, sourceSha256, and lexicon resolution.",
           }
-        "413": { description: Upload exceeds the GCG limit. }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "415":
+          {
+            description: Content-Type must be text/plain or application/octet-stream.,
+          }
         "422": { description: GCG could not be parsed. }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /imports/cross-tables:
     post:
       operationId: importCrossTablesGame
@@ -53,12 +123,17 @@ paths:
             description: "Validated document plus gameId, sourceUrl, gcgUrl, gcgBase64, and lexicon {status, source, hint, id}.",
           }
         "404": { description: Game or GCG file not found. }
+        "413":
+          { description: The fetched GCG exceeds the configured import limit. }
+        "415": { description: Content-Type must be application/json. }
         "422":
           {
             description: URL is not an allowlisted annotated-game link,
             or GCG is invalid.,
           }
         "502": { description: Cross-Tables could not be reached. }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /sessions:
     post:
       operationId: createSession
@@ -69,6 +144,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/SessionEnvelope" }
         "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /sessions/{sessionId}:
     parameters:
       - $ref: "#/components/parameters/SessionId"
@@ -81,6 +157,8 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/SessionEnvelope" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
     put:
       operationId: updateSession
       requestBody:
@@ -102,6 +180,10 @@ paths:
               schema: { $ref: "#/components/schemas/SessionEnvelope" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422": { $ref: "#/components/responses/Unprocessable" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /sessions/{sessionId}/share:
     parameters:
       - $ref: "#/components/parameters/SessionId"
@@ -115,6 +197,8 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ShareCollection" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
     post:
       operationId: createSessionShareLink
       description: Create an immutable snapshot-fork link. The optional shareLabel is visible to link recipients and stored alongside this link's immutable state snapshot; later local scenario renames do not change it. The bearer token is returned only once; store/copy the URL if it must be retained.
@@ -136,10 +220,13 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ShareCreated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
           { description: Per-session share snapshot storage limit reached. }
+        "413": { $ref: "#/components/responses/TooLarge" }
         "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /sessions/{sessionId}/share/{shareId}:
     parameters:
       - $ref: "#/components/parameters/SessionId"
@@ -153,6 +240,9 @@ paths:
       responses:
         "200": { description: Link revoked. }
         "404": { $ref: "#/components/responses/NotFound" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /sessions/{sessionId}/share-notices/{shareId}:
     parameters:
       - $ref: "#/components/parameters/SessionId"
@@ -165,6 +255,9 @@ paths:
       responses:
         "200": { description: Notice dismissed. }
         "404": { $ref: "#/components/responses/NotFound" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /shares/redeem:
     post:
       operationId: redeemShareLink
@@ -188,6 +281,8 @@ paths:
               schema: { $ref: "#/components/schemas/ShareRedeemed" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/RateLimited" }
         "503": { $ref: "#/components/responses/Unavailable" }
   /sessions/{sessionId}/moves/generate:
     parameters:
@@ -218,7 +313,9 @@ paths:
                   moves:
                     type: array
                     items: { $ref: "#/components/schemas/Move" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "413": { $ref: "#/components/responses/TooLarge" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "503": { $ref: "#/components/responses/Unavailable" }
         "504": { $ref: "#/components/responses/Deadline" }
@@ -249,8 +346,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/JobEnvelope" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "413": { $ref: "#/components/responses/TooLarge" }
         "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /sessions/{sessionId}/analysis/jobs/{jobId}:
     parameters:
       - $ref: "#/components/parameters/SessionId"
@@ -264,6 +364,8 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/JobEnvelope" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
     delete:
       operationId: cancelAnalysisJob
       responses:
@@ -273,6 +375,9 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/JobEnvelope" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /sessions/{sessionId}/analysis/jobs/{jobId}/retry:
     parameters:
       - $ref: "#/components/parameters/SessionId"
@@ -288,15 +393,24 @@ paths:
               schema: { $ref: "#/components/schemas/JobEnvelope" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /sessions/{sessionId}/events:
     parameters:
       - $ref: "#/components/parameters/SessionId"
     get:
       operationId: connectSessionEvents
-      description: WebSocket upgrade for session events.
+      description: >-
+        WebSocket upgrade for session events. The browser Origin must match
+        this API origin (or an explicitly configured origin); sync messages
+        are limited to 1 KiB and oversized messages close with code 1009.
       responses:
         "101": { description: Switching Protocols }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /sessions/{sessionId}/lexicons:
     parameters:
       - $ref: "#/components/parameters/SessionId"
@@ -358,6 +472,11 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Request Origin is not allowed for this session operation.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
     Conflict:
       description: Revision, idempotency, or compatibility conflict.
       content:
@@ -381,7 +500,9 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
     Unavailable:
-      description: Compute unavailable or saturated.
+      description: Compute unavailable, saturated, or admission control unavailable.
+      headers:
+        Retry-After: { schema: { type: integer, minimum: 1 } }
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }

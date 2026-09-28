@@ -24,6 +24,9 @@
   the last move and notes, and can analyze any turn, marking the move played.
 - Analysis no longer refuses boards containing an unchallenged phony; the words
   are reported as warnings, matching upstream Quackle.
+- The HTTP contract documents origin, request-size, and admission-limit
+  responses so clients can handle `403`, `413`, and `429` without changing the
+  existing sharing or import workflows.
 
 - Board cells are sized from one container-query value, stay square when tiles
   are placed, and fit phones down to 320px without horizontal scrolling.

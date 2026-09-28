@@ -7,6 +7,9 @@ ships the contract but not the hosted service implementation.
 
 - `GET /api/v1/meta` — engine, board, capability, and lexicon metadata.
 - `POST /api/v1/sessions` — create an anonymous analysis session.
+- `POST /api/v1/moves/generate` — legacy stateless protocol-v1 generation using
+  the default fast pool; new browser clients should use the session-bound
+  generation endpoint.
 - `GET`/`PUT /api/v1/sessions/{id}` — read or revision-update canonical state.
 - `POST /api/v1/sessions/{id}/moves/generate` — request ranked static moves.
 - `POST /api/v1/sessions/{id}/analysis/jobs` — create a durable deep-analysis job.
@@ -52,6 +55,14 @@ or recipient forks.
 
 All mutations use an expected revision or idempotency key. Imported files are
 bounded text data, never filenames, paths, archives, commands, or configuration.
+
+Browser clients should send cookie-authenticated mutations and WebSocket
+upgrades from the same allowed application origin. Compatible services may
+return `403` for an origin mismatch, `413` for oversized requests, or `429`
+with `Retry-After` when admission limits are reached. An externally hosted
+browser client requires an explicitly trusted origin and a separately
+configured credentialed CORS policy; an Origin check alone does not enable
+CORS. Do not use wildcard CORS with capability cookies.
 
 See [`contracts/openapi.yaml`](../contracts/openapi.yaml) for the machine-readable
 HTTP contract.
