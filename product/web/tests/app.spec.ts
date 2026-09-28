@@ -46,6 +46,7 @@ async function mockSessionApi(
     shareNotice?: boolean;
     shareActive?: boolean;
     shareRedemptionDelayMs?: number;
+    shareRedemptionLabel?: string;
   } = {},
 ) {
   let nextSession = 0;
@@ -59,6 +60,10 @@ async function mockSessionApi(
   const shareIdsBySession = new Map<string, string[]>(
     options.shareActive ? [[SESSION_ID, [shareId]]] : [],
   );
+  const shareLabelsById = new Map<string, string | null>(
+    options.shareActive ? [[shareId, null]] : [],
+  );
+  const shareLabelsByToken = new Map<string, string | null>();
   const shareNoticeBySession = new Set<string>(
     options.shareNotice ? [SESSION_ID] : [],
   );
@@ -136,6 +141,13 @@ async function mockSessionApi(
         setTimeout(resolve, options.shareRedemptionDelayMs),
       );
     }
+    const redeemBody = JSON.parse(route.request().postData() ?? "{}") as {
+      token?: string;
+    };
+    const shareLabel =
+      (redeemBody.token ? shareLabelsByToken.get(redeemBody.token) : null) ??
+      options.shareRedemptionLabel ??
+      "Recipient-visible label";
     forkState = {
       ...emptyState(),
       metadata: {
@@ -151,13 +163,14 @@ async function mockSessionApi(
         "set-cookie":
           "__Host-quackle_capability_e2e-fork-session-abcdefgh=fork-capability",
       },
-      body: JSON.stringify(
-        sessionBody(
+      body: JSON.stringify({
+        ...sessionBody(
           { ...forkState, metadata: forkState.metadata },
           0,
           forkSessionId,
         ),
-      ),
+        shareLabel,
+      }),
     });
   });
 
@@ -195,6 +208,7 @@ async function mockSessionApi(
             expiresAt: null,
             useCount: 0,
             lastUsedAt: null,
+            shareLabel: shareLabelsById.get(id) ?? null,
           })),
           notices: shareNoticeBySession.has(routeSessionId)
             ? [
@@ -214,10 +228,20 @@ async function mockSessionApi(
     if (url.pathname.endsWith("/share") && request.method() === "POST") {
       createdShareCount += 1;
       const newShareId = `e2e-share-${createdShareCount}-abcdefghijkl`;
+      const requestBody = JSON.parse(request.postData() ?? "{}") as {
+        shareLabel?: unknown;
+      };
+      const shareLabel =
+        typeof requestBody.shareLabel === "string"
+          ? requestBody.shareLabel
+          : null;
+      const token = `share-token-${createdShareCount}-abcdefghijklmnopqrstuvwxyz0123456789`;
       shareIdsBySession.set(routeSessionId, [
         ...(shareIdsBySession.get(routeSessionId) ?? []),
         newShareId,
       ]);
+      shareLabelsById.set(newShareId, shareLabel);
+      shareLabelsByToken.set(token, shareLabel);
       await route.fulfill({
         status: 201,
         contentType: "application/json",
@@ -226,9 +250,10 @@ async function mockSessionApi(
             shareId: newShareId,
             sourceSessionId: routeSessionId,
             sourceRevision: session.revision,
-            token: `share-token-${createdShareCount}-abcdefghijklmnopqrstuvwxyz0123456789`,
+            token,
             expiresAt: null,
             lifetime: "until_revoked",
+            shareLabel,
           },
         }),
       });
@@ -442,6 +467,31 @@ async function enterRack(page: Page, letters: string) {
   await page.getByRole("button", { name: "Done" }).click();
 }
 
+async function openGameImport(page: Page) {
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  await page
+    .getByRole("dialog", { name: "Your workspace" })
+    .getByRole("button", { name: "Import game" })
+    .click();
+}
+
+async function chooseGcgFileForReview(
+  page: Page,
+  name: string,
+  contents: string,
+) {
+  await page
+    .locator('input[type="file"][accept="text/plain,.gcg,.txt"]')
+    .setInputFiles({
+      name,
+      mimeType: "text/plain",
+      buffer: Buffer.from(contents),
+    });
+  await expect(
+    page.getByRole("heading", { name: "Review imported game" }),
+  ).toBeVisible();
+}
+
 async function clearDraft(page: Page) {
   await page.addInitScript(() => {
     indexedDB.deleteDatabase("quackle-web-drafts");
@@ -516,6 +566,7 @@ test("starts without fixture candidates, offers a random New game, and opens Abo
     .getByRole("dialog", { name: "Your workspace" })
     .getByRole("button", { name: "Blank position" })
     .click();
+  await page.getByRole("button", { name: "Create blank position" }).click();
   await expect(page.getByText("Session ready")).toBeVisible();
   await expect(page.locator(".rack-tile")).toHaveCount(0);
   await expect(page.locator(".board-cell.occupied")).toHaveCount(0);
@@ -563,6 +614,9 @@ test("creates an independent snapshot share link", async ({ page }) => {
     /#\/share\/e2e-session-abcdefghijkl\/share-token-/,
   );
   await expect(created.getByText(/shown only now/)).toBeVisible();
+  await expect(
+    created.getByText(/Recipients will see “New game/),
+  ).toBeVisible();
   const sourceHandles = await page.evaluate(async () => {
     const request = indexedDB.open("quackle-web-drafts");
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
@@ -594,6 +648,7 @@ test("creates an independent snapshot share link", async ({ page }) => {
   await expect(source).toBeVisible();
   await source.getByRole("button", { name: /Check|Refresh/ }).click();
   await expect(source.getByText("1 active link")).toBeVisible();
+  await expect(source.locator(".share-link-row")).toContainText(/New game/);
   await expect(source).not.toContainText("share-token-");
   await source.getByRole("button", { name: "Revoke" }).click();
   const confirm = page.getByRole("alertdialog", { name: "Revoke this link?" });
@@ -609,6 +664,156 @@ test("creates an independent snapshot share link", async ({ page }) => {
   ).toHaveValue(/#\/share\/e2e-session-abcdefghijkl\/share-token-/);
   await replacement.getByRole("button", { name: "Done" }).click();
   await expect(source.getByText("1 active link")).toBeVisible();
+});
+
+test("scenario names can be set on creation and renamed without changing existing share labels", async ({
+  page,
+}) => {
+  await clearDraft(page);
+  await mockSessionApi(page);
+  await page.goto("/");
+  await expect(page.getByText("Session ready")).toBeVisible();
+
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  const workspace = page.getByRole("dialog", { name: "Your workspace" });
+  await workspace
+    .locator(".scenario-create-actions")
+    .getByRole("button", { name: /New game/ })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Start a new game" }),
+  ).toBeVisible();
+  await page.getByLabel("Scenario name").fill("é".repeat(65));
+  await page.getByRole("button", { name: "Create game" }).click();
+  await expect(page.getByRole("alert")).toContainText("UTF-8 bytes");
+  await page.getByLabel("Scenario name").fill("Opening Study");
+  await page.getByRole("button", { name: "Create game" }).click();
+  await expect(page.getByText("Opening Study", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Open settings" }).click();
+  await page.getByRole("button", { name: "Share scenario" }).click();
+  const firstShare = page.getByRole("dialog", { name: "Share scenario" });
+  await expect(
+    firstShare.getByText(/Recipients will see “Opening Study”/),
+  ).toBeVisible();
+  const firstUrl = await firstShare
+    .getByRole("textbox", { name: "One-time share URL" })
+    .inputValue();
+  await firstShare.getByRole("button", { name: "Done" }).click();
+  await page.getByRole("button", { name: "Close settings" }).click();
+
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  const manager = page.getByRole("dialog", { name: "Your workspace" });
+  await manager.getByRole("tab", { name: "Share links" }).click();
+  const source = manager
+    .locator(".share-source-card")
+    .filter({ hasText: "Opening Study" })
+    .first();
+  await source.getByRole("button", { name: /Check|Refresh/ }).click();
+  await expect(source.locator(".share-link-row")).toContainText(
+    "Opening Study",
+  );
+
+  await manager.getByRole("tab", { name: "Scenarios" }).click();
+  const currentScenario = manager
+    .locator(".scenario-item")
+    .filter({ hasText: "Opening Study" })
+    .first();
+  await currentScenario
+    .getByRole("button", { name: "Rename scenario Opening Study" })
+    .click();
+  const rename = page.getByRole("dialog", { name: "Rename scenario" });
+  await rename.getByLabel("Scenario name").fill("Endgame Review");
+  await rename.getByRole("button", { name: "Save name" }).click();
+  await expect(
+    page
+      .getByRole("region", { name: "Session context" })
+      .getByText("Endgame Review", { exact: true }),
+  ).toBeVisible();
+
+  await manager.getByRole("tab", { name: "Share links" }).click();
+  const renamedSource = manager
+    .locator(".share-source-card")
+    .filter({ hasText: "Endgame Review" })
+    .first();
+  await expect(renamedSource.locator(".share-link-row")).toContainText(
+    "Opening Study",
+  );
+  await renamedSource
+    .getByRole("button", { name: "Create another link" })
+    .click();
+  const secondShare = page.getByRole("dialog", { name: "Share scenario" });
+  await expect(
+    secondShare.getByText(/Recipients will see “Endgame Review”/),
+  ).toBeVisible();
+  const secondUrl = await secondShare
+    .getByRole("textbox", { name: "One-time share URL" })
+    .inputValue();
+  expect(secondUrl).not.toBe(firstUrl);
+  await secondShare.getByRole("button", { name: "Done" }).click();
+  await expect(renamedSource.locator(".share-link-row")).toHaveCount(2);
+  await expect(
+    renamedSource
+      .locator(".share-link-row")
+      .filter({ hasText: "Endgame Review" }),
+  ).toHaveCount(1);
+  await expect(
+    renamedSource
+      .locator(".share-link-row")
+      .filter({ hasText: "Opening Study" }),
+  ).toHaveCount(1);
+});
+
+test("a cross-tab rename survives a stale tab autosaving its game edits", async ({
+  page,
+}) => {
+  await clearDraft(page);
+  await mockSessionApi(page);
+  await page.goto("/");
+  await expect(page.getByText("Session ready")).toBeVisible();
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  const ownerWorkspace = page.getByRole("dialog", { name: "Your workspace" });
+  const localId = await ownerWorkspace
+    .locator(".scenario-item.active")
+    .getAttribute("data-local-scenario-id");
+  expect(localId).toBeTruthy();
+  await page.getByRole("button", { name: "Close scenarios" }).click();
+
+  const otherTab = await page.context().newPage();
+  await mockSessionApi(otherTab);
+  await otherTab.goto("/");
+  await expect(
+    otherTab.getByText(
+      /Session ready|Recovered local draft|Session changed · local copy preserved/,
+    ),
+  ).toBeVisible();
+  await otherTab.getByRole("button", { name: "Open recent scenarios" }).click();
+  const otherWorkspace = otherTab.getByRole("dialog", {
+    name: "Your workspace",
+  });
+  const scenario = otherWorkspace.locator(
+    `[data-local-scenario-id="${localId}"]`,
+  );
+  await scenario.getByRole("button", { name: /Rename scenario/ }).click();
+  const rename = otherTab.getByRole("dialog", { name: "Rename scenario" });
+  await rename.getByLabel("Scenario name").fill("Named in second tab");
+  await rename.getByRole("button", { name: "Save name" }).click();
+  await otherTab.getByRole("button", { name: "Close scenarios" }).click();
+
+  await enterRack(page, "B");
+  await expect
+    .poll(async () => readScenarioSnapshot(page, localId!))
+    .toMatchObject({
+      scenario: {
+        title: "Named in second tab",
+        localTitleRevision: 1,
+        state: { position: { rack: "B" } },
+      },
+    });
+  await expect(
+    page.getByRole("region", { name: "Session context" }),
+  ).toContainText("Named in second tab");
+  await otherTab.close();
 });
 
 test("shows and dismisses automatic share-link eviction notices", async ({
@@ -659,6 +864,7 @@ test("removing a shared scenario preserves its link for management", async ({
   await page.getByRole("button", { name: "Open recent scenarios" }).click();
   const scenarios = page.getByRole("dialog", { name: "Your workspace" });
   await scenarios.getByRole("button", { name: "Blank position" }).click();
+  await page.getByRole("button", { name: "Create blank position" }).click();
   await expect(page.getByText("Session ready")).toBeVisible();
   await page.getByRole("button", { name: "Open recent scenarios" }).click();
   const list = page.getByRole("dialog", { name: "Your workspace" });
@@ -838,6 +1044,7 @@ test("a stale tab preserves edits instead of overwriting a scenario generation c
     otherManager.locator(`[data-local-scenario-id="${activeLocalId}"]`),
   ).toHaveClass(/active/);
   await otherManager.getByRole("button", { name: "Blank position" }).click();
+  await otherTab.getByRole("button", { name: "Create blank position" }).click();
   await expect(otherTab.locator(".rack .rack-empty")).toBeVisible();
 
   const advancedScenario = await readScenarioSnapshot(page, activeLocalId!);
@@ -894,6 +1101,7 @@ test("removing an active scenario from a stale tab cannot overwrite a newer cros
   await otherTab.getByRole("button", { name: "Open recent scenarios" }).click();
   const otherManager = otherTab.getByRole("dialog", { name: "Your workspace" });
   await otherManager.getByRole("button", { name: "Blank position" }).click();
+  await otherTab.getByRole("button", { name: "Create blank position" }).click();
   await expect(otherTab.locator(".rack .rack-empty")).toBeVisible();
 
   await expect
@@ -1042,11 +1250,17 @@ test("redeems a share fragment into an independent fork scenario", async ({
   ).toBeVisible();
   await expect(page).not.toHaveURL(/#\/share\//);
   await page.getByRole("button", { name: "Open recent scenarios" }).click();
-  await expect(
-    page
-      .getByRole("dialog", { name: "Your workspace" })
-      .getByRole("button", { name: /Open scenario Forked · Shared fixture/ }),
-  ).toBeVisible();
+  const manager = page.getByRole("dialog", { name: "Your workspace" });
+  const forkRow = manager
+    .locator(".scenario-item")
+    .filter({ hasText: "Forked · Recipient-visible label" });
+  await expect(forkRow).toBeVisible();
+  const forkId = await forkRow.getAttribute("data-local-scenario-id");
+  expect(forkId).toBeTruthy();
+  const forkScenario = (await readScenarioSnapshot(page, forkId!)).scenario;
+  const forkState = forkScenario?.state as
+    { metadata?: { title?: string } } | undefined;
+  expect(forkState?.metadata?.title).toBe("Shared fixture");
 });
 
 test("removes a share bearer fragment before redemption completes", async ({
@@ -1129,18 +1343,32 @@ test("imports and exports a bounded Quackle GCG game", async ({ page }) => {
   await page.goto("/");
 
   await expect(page.getByText("Session ready")).toBeVisible();
-  await page.getByRole("button", { name: "Open settings" }).click();
-  await page
-    .locator('input[type="file"][accept="text/plain,.gcg,.txt"]')
-    .setInputFiles({
-      name: "fixture.gcg",
-      mimeType: "text/plain",
-      buffer: Buffer.from(
-        `#character-encoding UTF-8\n#title E2E fixture\n#player1 A Alice\n#player2 B Bob\n#lexicon NWL23\n>A: ADEIRST 8D DISRATE +70 70\n>B: ABCDEFG - 0 0\n#rack1 ADEIRST\n`,
-      ),
-    });
+  await openGameImport(page);
+  await chooseGcgFileForReview(
+    page,
+    "fixture.gcg",
+    `#character-encoding UTF-8\n#title E2E fixture\n#player1 A Alice\n#player2 B Bob\n#lexicon NWL23\n>A: ADEIRST 8D DISRATE +70 70\n>B: ABCDEFG - 0 0\n#rack1 ADEIRST\n`,
+  );
+  await page.getByLabel("Scenario name").fill("E2E imported study");
+  await page.getByRole("button", { name: "Create imported scenario" }).click();
   await expect(page.getByRole("button", { name: "H8 A" })).toBeVisible();
   await expect(page.getByText("2 history records")).toBeVisible();
+  await expect(page.getByText("E2E imported study")).toBeVisible();
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  const workspace = page.getByRole("dialog", { name: "Your workspace" });
+  await expect(
+    workspace
+      .locator(".scenario-item")
+      .filter({ hasText: "E2E imported study" }),
+  ).toBeVisible();
+  await expect(
+    workspace.locator(".scenario-item").filter({ hasText: "New game" }),
+  ).toBeVisible();
+  await expect(workspace.locator(".scenario-item.active")).toContainText(
+    "E2E imported study",
+  );
+  await page.getByRole("button", { name: "Close scenarios" }).click();
+  await page.getByRole("button", { name: "Open settings" }).click();
   const downloadPromise = page.waitForEvent("download");
   await page.getByRole("button", { name: "Export GCG" }).click();
   const download = await downloadPromise;
@@ -1148,7 +1376,33 @@ test("imports and exports a bounded Quackle GCG game", async ({ page }) => {
   expect(downloadPath).toBeTruthy();
   const exported = await readFile(downloadPath!, "utf8");
   expect(exported).toContain("#lexicon NWL23");
+  expect(exported).toContain("#title E2E fixture");
+  expect(exported).not.toContain("#title E2E imported study");
   expect(exported).toContain(">A: ADEIRST 8D DISRATE +70 70");
+});
+
+test("canceling an import review leaves the current scenario untouched", async ({
+  page,
+}) => {
+  await clearDraft(page);
+  await mockSessionApi(page);
+  await page.goto("/");
+  await expect(page.getByText("Session ready")).toBeVisible();
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  const workspace = page.getByRole("dialog", { name: "Your workspace" });
+  await workspace.getByRole("button", { name: "Import game" }).click();
+  await chooseGcgFileForReview(
+    page,
+    "cancel-me.gcg",
+    `#character-encoding UTF-8\n#title Must not replace the active game\n#player1 A Alice\n#player2 B Bob\n#lexicon NWL23\n>A: ADEIRST 8D DISRATE +70 70\n`,
+  );
+  await expect(page.locator(".board-cell.occupied")).toHaveCount(0);
+  await page.getByRole("button", { name: "Back to scenarios" }).click();
+  await expect(workspace.locator(".scenario-item")).toHaveCount(1);
+  await expect(workspace.locator(".scenario-item.active")).toContainText(
+    "New game",
+  );
+  await expect(page.locator(".rack-tile")).toHaveCount(7);
 });
 
 test("selects CSW24 for static generation and preserves its identity", async ({
@@ -1184,19 +1438,15 @@ test("replays imported GCG records and returns to the editable final position", 
   await page.goto("/");
 
   await expect(page.getByText("Session ready")).toBeVisible();
-  await page.getByRole("button", { name: "Open settings" }).click();
-  await page
-    .locator('input[type="file"][accept="text/plain,.gcg,.txt"]')
-    .setInputFiles({
-      name: "replay.gcg",
-      mimeType: "text/plain",
-      buffer: Buffer.from(
-        `#character-encoding UTF-8\n#title Replay fixture\n#player1 A Alice\n#player2 B Bob\n#lexicon NWL23\n>A: ADEIRST 8D DISRATE +70 70\n>B: ABCDEFG - 0 0\n>A: ADEIRST D7 a. +2 72\n>A: ADEIRST -- +0 70\n>B: ABCDEFG (challenge) +5 5\n>A: (T) -1 69\n>B: (ABC) +8 13\n#rack2 ABCDEFG\n`,
-      ),
-    });
+  await openGameImport(page);
+  await chooseGcgFileForReview(
+    page,
+    "replay.gcg",
+    `#character-encoding UTF-8\n#title Replay fixture\n#player1 A Alice\n#player2 B Bob\n#lexicon NWL23\n>A: ADEIRST 8D DISRATE +70 70\n>B: ABCDEFG - 0 0\n>A: ADEIRST D7 a. +2 72\n>A: ADEIRST -- +0 70\n>B: ABCDEFG (challenge) +5 5\n>A: (T) -1 69\n>B: (ABC) +8 13\n#rack2 ABCDEFG\n`,
+  );
+  await page.getByRole("button", { name: "Create imported scenario" }).click();
   await expect(page.getByRole("button", { name: "H8 A" })).toBeVisible();
   await expect(page.getByText("7 history records")).toBeVisible();
-  await page.getByRole("button", { name: "Close settings" }).click();
 
   await page.getByRole("button", { name: "Replay game" }).click();
   await expect(page.getByText("Record 0 of 7")).toBeVisible();
@@ -1226,14 +1476,19 @@ test.describe("Cross-Tables browser mediation", () => {
     await page.goto("/");
 
     await expect(page.getByText("Session ready")).toBeVisible();
-    await page.getByRole("button", { name: "Open settings" }).click();
+    await openGameImport(page);
     await page
       .getByLabel("Cross-Tables game URL")
       .fill("https://cross-tables.com/annotated.php?u=5241#0#");
-    await page.getByRole("button", { name: "Import public GCG" }).click();
+    await page.getByRole("button", { name: "Fetch and review game" }).click();
+    await expect(
+      page.getByRole("heading", { name: "Review imported game" }),
+    ).toBeVisible();
+    await page
+      .getByRole("button", { name: "Create imported scenario" })
+      .click();
     await expect(page.getByRole("button", { name: "H8 A" })).toBeVisible();
     await expect(page.getByText("2 history records")).toBeVisible();
-    await expect(page.getByRole("alertdialog")).toHaveCount(0);
     await expect(page.locator(".lexicon-chip")).toContainText("NWL2023");
   });
 
@@ -1243,11 +1498,11 @@ test.describe("Cross-Tables browser mediation", () => {
     await page.goto("/");
 
     await expect(page.getByText("Session ready")).toBeVisible();
-    await page.getByRole("button", { name: "Open settings" }).click();
+    await openGameImport(page);
     await page
       .getByLabel("Cross-Tables game URL")
       .fill("https://www.cross-tables.com/annotated.php?u=9");
-    await page.getByRole("button", { name: "Import public GCG" }).click();
+    await page.getByRole("button", { name: "Fetch and review game" }).click();
     await expect(
       page.getByText(
         /Cross-Tables import failed · Cross-Tables game or GCG file was not found/,
@@ -1264,19 +1519,14 @@ test("replays a game with both player names, the mover's rack, and turn analysis
   await page.goto("/");
 
   await expect(page.getByText("Session ready")).toBeVisible();
-  await page.getByRole("button", { name: "Open settings" }).click();
-  await page
-    .locator('input[type="file"][accept="text/plain,.gcg,.txt"]')
-    .setInputFiles({
-      name: "turns.gcg",
-      mimeType: "text/plain",
-      buffer: Buffer.from(
-        `#character-encoding UTF-8\n#player1 Samuel_Kaplan Samuel Kaplan\n#player2 Verna Verna Berg\n#lexicon NWL23\n>Samuel_Kaplan: AEMNNUU -NUU +0 0\n>Verna: ADEIRST 8G STAIRED +68 68\n#note Could have played DISRATE.\n>Samuel_Kaplan: AEEGOPT -OPT +0 0\n#rack2 ADEI\n`,
-      ),
-    });
+  await openGameImport(page);
+  await chooseGcgFileForReview(
+    page,
+    "turns.gcg",
+    `#character-encoding UTF-8\n#player1 Samuel_Kaplan Samuel Kaplan\n#player2 Verna Verna Berg\n#lexicon NWL23\n>Samuel_Kaplan: AEMNNUU -NUU +0 0\n>Verna: ADEIRST 8G STAIRED +68 68\n#note Could have played DISRATE.\n>Samuel_Kaplan: AEEGOPT -OPT +0 0\n#rack2 ADEI\n`,
+  );
+  await page.getByRole("button", { name: "Create imported scenario" }).click();
   // The success message must survive the session connection.
-  await expect(page.getByText(/Imported 3 records · NWL2023/)).toBeVisible();
-  await page.getByRole("button", { name: "Close settings" }).click();
   await expect(page.getByText(/Imported 3 records · NWL2023/)).toBeVisible();
   await expect(page.locator(".score-card").first()).toContainText(
     "Samuel Kaplan",
@@ -1319,20 +1569,16 @@ test("asks which dictionary to use for a GCG without #lexicon", async ({
   await page.goto("/");
 
   await expect(page.getByText("Session ready")).toBeVisible();
-  await page.getByRole("button", { name: "Open settings" }).click();
+  await openGameImport(page);
+  await chooseGcgFileForReview(
+    page,
+    "nolexicon.gcg",
+    `#character-encoding UTF-8\n#player1 A Alice\n#player2 B Bob\n>A: ADEIRST 8D DISRATE +70 70\n`,
+  );
   await page
-    .locator('input[type="file"][accept="text/plain,.gcg,.txt"]')
-    .setInputFiles({
-      name: "nolexicon.gcg",
-      mimeType: "text/plain",
-      buffer: Buffer.from(
-        `#character-encoding UTF-8\n#player1 A Alice\n#player2 B Bob\n>A: ADEIRST 8D DISRATE +70 70\n`,
-      ),
-    });
-  const prompt = page.getByRole("alertdialog", { name: "Which dictionary?" });
-  await expect(prompt).toBeVisible();
-  await prompt.getByRole("button", { name: "CSW24" }).click();
-  await expect(prompt).toHaveCount(0);
+    .getByLabel("Which dictionary was this game played with?")
+    .selectOption("csw24");
+  await page.getByRole("button", { name: "Create imported scenario" }).click();
   await expect(page.getByRole("button", { name: "H8 A" })).toBeVisible();
   await expect(page.locator(".lexicon-chip")).toContainText("CSW24");
 });
@@ -1388,12 +1634,11 @@ test("recent scenarios switch without losing local positions", async ({
 
   await page.getByRole("button", { name: "Open recent scenarios" }).click();
   await expect(
-    page.getByText(
-      "This browser shows the 100 most recent scenarios plus any local drafts and the current one.",
-    ),
+    page.getByText(/This browser shows the 100 most recent scenarios/),
   ).toBeVisible();
   const scenarios = page.getByRole("dialog", { name: "Your workspace" });
   await scenarios.getByRole("button", { name: "Blank position" }).click();
+  await page.getByRole("button", { name: "Create blank position" }).click();
   await expect(page.getByText("Session ready")).toBeVisible();
   await enterRack(page, "D");
   await page.locator(".rack-tile").first().click();

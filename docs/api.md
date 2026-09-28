@@ -12,15 +12,17 @@ ships the contract but not the hosted service implementation.
 - `POST /api/v1/sessions/{id}/analysis/jobs` — create a durable deep-analysis job.
 - `GET`/`DELETE /api/v1/sessions/{id}/analysis/jobs/{job}` — poll or cancel a job.
 - `GET /api/v1/sessions/{id}/events` — optional WebSocket acceleration channel.
-- `GET`/`POST /api/v1/sessions/{id}/share` — list safe share metadata or create a
-  snapshot-fork link (the bearer URL is returned only when created).
+- `GET`/`POST /api/v1/sessions/{id}/share` — list safe per-link labels/metadata
+  or create a snapshot-fork link with an optional recipient-visible label (the
+  bearer URL is returned only when created).
 - `DELETE /api/v1/sessions/{id}/share/{shareId}` — revoke one link; existing
   forks remain independent.
 - `DELETE /api/v1/sessions/{id}/share-notices/{shareId}` — dismiss an automatic
   eviction notice.
 - `POST /api/v1/shares/redeem` — redeem a fragment token and create an
-  independent session/capability; the browser strips the fragment from history
-  before the request begins.
+  independent session/capability, returning the captured display label
+  separately from canonical game state; the browser strips the fragment from
+  history before the request begins.
 - `POST /api/v1/imports/gcg` — validate imported GCG before session creation.
 - `POST /api/v1/imports/cross-tables` — service-side import of one allowlisted
   Cross-Tables annotated game (Cross-Tables sends no CORS headers). Returns the
@@ -44,6 +46,9 @@ a server-delete endpoint or revoke a snapshot share. Revocation remains a
 separate owner-authorized `DELETE /api/v1/sessions/{id}/share/{shareId}` request.
 The browser retains known source handles after the last link is revoked, so a
 replacement link can be created from the Share links manager.
+Scenario names are browser-local; a new link captures the current name as a
+recipient-visible label. Renaming does not change existing links, snapshots,
+or recipient forks.
 
 All mutations use an expected revision or idempotency key. Imported files are
 bounded text data, never filenames, paths, archives, commands, or configuration.

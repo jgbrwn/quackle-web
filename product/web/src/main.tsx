@@ -21,13 +21,16 @@ import {
   listScenarios,
   listShareSources,
   loadActiveScenario,
+  MAX_SCENARIO_TITLE_BYTES,
   MAX_LOCAL_SCENARIOS,
   newScenarioId,
   rememberShareSource,
+  renameScenario,
   restoreDeletedScenario,
   saveScenario,
   setActiveScenario,
   subscribeToScenarioEvents,
+  validateScenarioTitle,
   type ScenarioKind,
   type ScenarioRecord,
   type ScenarioSource,
@@ -63,7 +66,8 @@ async function fetchShareCollection(
           typeof value.createdAt !== "string" ||
           (value.expiresAt !== null && typeof value.expiresAt !== "string") ||
           typeof value.useCount !== "number" ||
-          (value.lastUsedAt !== null && typeof value.lastUsedAt !== "string")
+          (value.lastUsedAt !== null && typeof value.lastUsedAt !== "string") ||
+          (value.shareLabel != null && typeof value.shareLabel !== "string")
         )
           return [];
         return [
@@ -74,6 +78,8 @@ async function fetchShareCollection(
             expiresAt: value.expiresAt,
             useCount: value.useCount,
             lastUsedAt: value.lastUsedAt,
+            shareLabel:
+              typeof value.shareLabel === "string" ? value.shareLabel : null,
           },
         ];
       })
@@ -123,12 +129,14 @@ type ConnectionState = "connecting" | "online" | "offline";
 type AnalysisPhase =
   "idle" | "saving" | "starting" | "warming" | "queued" | "running";
 type AnalysisMode = "fast" | "deep";
+type WorkspacePanel = "list" | "new" | "blank" | "import";
 type SessionResponse = {
   session: {
     id: string;
     revision: number;
     state: unknown;
   };
+  shareLabel?: string | null;
 };
 
 type SessionPersistResult = {
@@ -144,6 +152,19 @@ type ShareLink = {
   expiresAt: string | null;
   useCount: number;
   lastUsedAt: string | null;
+  shareLabel: string | null;
+};
+
+type PreparedGcgImport = {
+  parsed: GcgImportResult;
+  filename: string;
+  sourceUrl?: string;
+  sourceSha256?: string;
+  sourceEncoding: string;
+  lexiconHint: string | null;
+  lexiconId: LexiconId | null;
+  requiresLexiconChoice: boolean;
+  defaultScenarioName: string;
 };
 
 type ShareLinkNotice = {
@@ -376,6 +397,28 @@ function formatScenarioTime(timestamp = new Date().toISOString()): string {
     hour: "numeric",
     minute: "2-digit",
   });
+}
+
+function fitScenarioTitle(value: string): string {
+  const normalized = value
+    .replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  let result = "";
+  let byteLength = 0;
+  const encoder = new TextEncoder();
+  for (const character of normalized) {
+    const characterBytes = encoder.encode(character).byteLength;
+    if (byteLength + characterBytes > MAX_SCENARIO_TITLE_BYTES) break;
+    result += character;
+    byteLength += characterBytes;
+  }
+  return result.trim() || "Untitled scenario";
+}
+
+function scenarioTitleInput(value: string, fallback: string): string | null {
+  if (value.trim().length === 0) return fallback;
+  return validateScenarioTitle(value);
 }
 
 const positionFor = (index: number) =>
@@ -980,6 +1023,23 @@ function App() {
   const [scenarioTab, setScenarioTab] = useState<"scenarios" | "shares">(
     "scenarios",
   );
+  const [workspacePanel, setWorkspacePanel] = useState<WorkspacePanel>("list");
+  const [scenarioNameDraft, setScenarioNameDraft] = useState("");
+  const [scenarioNameFallback, setScenarioNameFallback] = useState("");
+  const [scenarioNameError, setScenarioNameError] = useState<string | null>(
+    null,
+  );
+  const [renameCandidate, setRenameCandidate] = useState<ScenarioRecord | null>(
+    null,
+  );
+  const [renameNameDraft, setRenameNameDraft] = useState("");
+  const [renameBusy, setRenameBusy] = useState(false);
+  const [preparedGcgImport, setPreparedGcgImport] =
+    useState<PreparedGcgImport | null>(null);
+  const [importNameDraft, setImportNameDraft] = useState("");
+  const [importLexiconChoice, setImportLexiconChoice] =
+    useState<LexiconId | null>(null);
+  const [importError, setImportError] = useState<string | null>(null);
   const [scenarioBusy, setScenarioBusy] = useState(false);
   const [scenarioRemovalCandidate, setScenarioRemovalCandidate] =
     useState<ScenarioRecord | null>(null);
@@ -1000,16 +1060,6 @@ function App() {
   >("horizontal");
   const [activeCellIndex, setActiveCellIndex] = useState(112);
   const [blankPickerIndex, setBlankPickerIndex] = useState<number | null>(null);
-  const [lexiconPrompt, setLexiconPrompt] = useState<
-    ((choice: LexiconId | null) => void) | null
-  >(null);
-  const askLexicon = () =>
-    new Promise<LexiconId | null>((resolve) => {
-      setLexiconPrompt(() => (choice: LexiconId | null) => {
-        setLexiconPrompt(null);
-        resolve(choice);
-      });
-    });
   const [movesOpen, setMovesOpen] = useState(true);
   const activeCellRef = useRef<HTMLButtonElement | null>(null);
   const dragRef = useRef<{
@@ -1032,6 +1082,7 @@ function App() {
   const suppressRackClickRef = useRef(false);
   const [crossTablesUrl, setCrossTablesUrl] = useState("");
   const [crossTablesBusy, setCrossTablesBusy] = useState(false);
+  const importRequestRef = useRef(0);
   const [shareSources, setShareSources] = useState<ShareSourceRecord[]>([]);
   const [shareSourceViews, setShareSourceViews] = useState<
     Record<string, ShareSourceView>
@@ -1045,6 +1096,9 @@ function App() {
     useState<PendingShareRevoke | null>(null);
 
   const [shareCreationUrl, setShareCreationUrl] = useState<string | null>(null);
+  const [shareCreationLabel, setShareCreationLabel] = useState<string | null>(
+    null,
+  );
   const activeJobIdRef = useRef<string | null>(null);
   const analysisAbortRef = useRef<AbortController | null>(null);
   const analysisCancelledRef = useRef(false);
@@ -1198,6 +1252,9 @@ function App() {
     );
   }, [finalFrame, isReplaying, replayFrame]);
   const visibleTurn = replayFrame?.turn ?? draftState.position.turn;
+  const activeScenarioTitle =
+    scenarioList.find((scenario) => scenario.localId === activeLocalId)
+      ?.title ?? null;
 
   useEffect(() => {
     let cancelled = false;
@@ -1235,9 +1292,11 @@ function App() {
             localId: newScenarioId(),
             sessionId: data.session.id,
             kind: "forked",
-            title: sharedState.metadata?.title
-              ? `Forked · ${sharedState.metadata.title}`
-              : "Forked shared scenario",
+            title: data.shareLabel
+              ? `Forked · ${data.shareLabel}`
+              : sharedState.metadata?.title
+                ? `Forked · ${sharedState.metadata.title}`
+                : "Forked shared scenario",
             state: sharedState,
             revision: data.session.revision,
             dirty: false,
@@ -2389,24 +2448,127 @@ function App() {
     );
   };
 
-  const createNewGame = () =>
-    void createScenario(
-      "new",
-      `New game · ${formatScenarioTime()}`,
-      freshPositionState(randomOpeningRack()),
-      { kind: "new" },
-    );
-  const createBlankPosition = () =>
-    void createScenario(
-      "new",
-      `Blank position · ${formatScenarioTime()}`,
-      freshPositionState(),
-      { kind: "new" },
-    );
+  const beginScenarioCreation = (kind: "new" | "blank") => {
+    const fallback = `${kind === "new" ? "New game" : "Blank position"} · ${formatScenarioTime()}`;
+    setScenarioTab("scenarios");
+    setScenarioNameFallback(fallback);
+    setScenarioNameDraft(fallback);
+    setScenarioNameError(null);
+    setWorkspacePanel(kind);
+  };
 
-  const saveOrphanedScenarioCopy = () => {
+  const createNamedScenario = async () => {
+    if (workspacePanel !== "new" && workspacePanel !== "blank") return;
+    const title = scenarioTitleInput(scenarioNameDraft, scenarioNameFallback);
+    if (!title) {
+      setScenarioNameError(
+        `Use a name up to ${MAX_SCENARIO_TITLE_BYTES} UTF-8 bytes without control characters.`,
+      );
+      return;
+    }
+    const kind = workspacePanel;
+    const created = await createScenario(
+      "new",
+      title,
+      kind === "new"
+        ? freshPositionState(randomOpeningRack())
+        : freshPositionState(),
+      { kind: "new" },
+    );
+    if (!created) {
+      setScenarioNameError(
+        "The current scenario could not be safely switched. Save a copy of any open draft, then retry.",
+      );
+      return;
+    }
+    setWorkspacePanel("list");
+    setScenarioNameDraft("");
+    setScenarioNameFallback("");
+    setScenarioNameError(null);
+  };
+
+  const beginImportFlow = () => {
+    importRequestRef.current += 1;
+    setScenarioTab("scenarios");
+    setPreparedGcgImport(null);
+    setImportNameDraft("");
+    setImportLexiconChoice(null);
+    setImportError(null);
+    setCrossTablesBusy(false);
+    setWorkspacePanel("import");
+  };
+
+  const cancelWorkspacePanel = () => {
+    importRequestRef.current += 1;
+    setCrossTablesBusy(false);
+    setPreparedGcgImport(null);
+    setImportNameDraft("");
+    setImportLexiconChoice(null);
+    setImportError(null);
+    setScenarioNameError(null);
+    setWorkspacePanel("list");
+  };
+
+  const closeScenarios = () => {
+    cancelWorkspacePanel();
+    setScenariosOpen(false);
+  };
+
+  const openRenameScenario = (scenario: ScenarioRecord) => {
+    setRenameCandidate(scenario);
+    setRenameNameDraft(scenario.title);
+  };
+
+  const submitScenarioRename = async () => {
+    const candidate = renameCandidate;
+    if (!candidate || renameBusy) return;
+    const title = validateScenarioTitle(renameNameDraft);
+    if (!title) {
+      setStatus(
+        `Scenario names must be 1–${MAX_SCENARIO_TITLE_BYTES} UTF-8 bytes without control characters`,
+      );
+      return;
+    }
+    setRenameBusy(true);
+    try {
+      const renamed = await renameScenario(
+        candidate.localId,
+        title,
+        candidate.localTitleRevision ?? 0,
+      );
+      if (!renamed) {
+        const [scenarios, sources] = await Promise.all([
+          listScenarios(),
+          listShareSources(),
+        ]);
+        setScenarioList(scenarios);
+        setShareSources(sources);
+        setStatus(
+          "Scenario changed in another tab · review the current name and retry",
+        );
+        setRenameCandidate(null);
+        return;
+      }
+      const [scenarios, sources] = await Promise.all([
+        listScenarios(),
+        listShareSources(),
+      ]);
+      setScenarioList(scenarios);
+      setShareSources(sources);
+      setRenameCandidate(null);
+      setStatus(
+        `Renamed scenario to “${renamed.title}” · game state and share links are unchanged`,
+      );
+    } catch {
+      setStatus("Scenario name could not be saved · retry");
+    } finally {
+      setRenameBusy(false);
+    }
+  };
+
+  const saveOrphanedScenarioCopy = async () => {
     if (!orphanedScenarioTitle) return;
-    void createScenario(
+    const created = await createScenario(
       "new",
       `${orphanedScenarioTitle.slice(0, 48)} · recovered copy`,
       draftState,
@@ -2414,6 +2576,7 @@ function App() {
       true,
       true,
     );
+    if (created) setWorkspacePanel("list");
   };
 
   const removeScenarioFromBrowser = async () => {
@@ -2673,6 +2836,7 @@ function App() {
       if (event.key !== "Escape") return;
       if (shareCreationUrl) {
         setShareCreationUrl(null);
+        setShareCreationLabel(null);
         return;
       }
       if (pendingShareRevoke) {
@@ -2684,23 +2848,24 @@ function App() {
         setScenarioRemovalCandidate(null);
         return;
       }
-      if (lexiconPrompt) {
-        lexiconPrompt(null);
+      if (scenariosOpen && workspacePanel !== "list") {
+        cancelWorkspacePanel();
         return;
       }
       setBlankPickerIndex(null);
       setSettingsOpen(false);
-      setScenariosOpen(false);
+      closeScenarios();
       setAboutOpen(false);
     };
     window.addEventListener("keydown", handleEscape);
     return () => window.removeEventListener("keydown", handleEscape);
   }, [
-    lexiconPrompt,
     pendingShareRevoke,
     scenarioRemovalBusy,
     scenarioRemovalCandidate,
+    scenariosOpen,
     shareCreationUrl,
+    workspacePanel,
   ]);
 
   const revokeShareLink = async (sourceSessionId: string, shareId: string) => {
@@ -2788,11 +2953,14 @@ function App() {
     sourceTitle: string,
     sourceLocalId: string | null,
   ) => {
+    const shareLabel = fitScenarioTitle(sourceTitle);
     const response = await fetch(
       apiUrl(`/api/v1/sessions/${sourceSessionId}/share`),
       {
         method: "POST",
         credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ shareLabel }),
       },
     );
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -2804,6 +2972,7 @@ function App() {
         token?: unknown;
         expiresAt?: unknown;
         lifetime?: unknown;
+        shareLabel?: unknown;
       };
     };
     if (
@@ -2823,11 +2992,16 @@ function App() {
     // Keep the one-time URL in volatile UI state immediately. It is never
     // persisted in IndexedDB, even if a later management-list request fails.
     setShareCreationUrl(shareUrl);
+    setShareCreationLabel(
+      typeof data.share.shareLabel === "string"
+        ? data.share.shareLabel
+        : shareLabel,
+    );
     let managementHandleSaved = true;
     try {
       await rememberShareSource(
         data.share.sourceSessionId,
-        sourceTitle,
+        shareLabel,
         sourceLocalId,
       );
       await loadShareSources();
@@ -2842,7 +3016,7 @@ function App() {
         : [
             {
               sessionId: data.share!.sourceSessionId as string,
-              title: sourceTitle,
+              title: shareLabel,
               localId: sourceLocalId,
               firstSeenAt: new Date().toISOString(),
               lastSeenAt: new Date().toISOString(),
@@ -2891,11 +3065,9 @@ function App() {
     }
     const sourceSessionId = sessionId;
     const sourceLocalId = activeLocalIdRef.current;
-    const sourceTitle =
-      draftState.metadata?.title ??
+    let sourceTitle =
       scenarioList.find((scenario) => scenario.localId === sourceLocalId)
-        ?.title ??
-      "Shared scenario";
+        ?.title ?? "Shared scenario";
     try {
       if (scenarioDirty) {
         const persisted = await persistSession();
@@ -2912,6 +3084,17 @@ function App() {
         sessionIdRef.current !== sourceSessionId
       )
         return;
+      if (sourceLocalId) {
+        const latestScenario = await getScenario(sourceLocalId).catch(
+          () => null,
+        );
+        if (
+          activeLocalIdRef.current !== sourceLocalId ||
+          sessionIdRef.current !== sourceSessionId
+        )
+          return;
+        if (latestScenario) sourceTitle = latestScenario.title;
+      }
       await createShareLinkForSource(
         sourceSessionId,
         sourceTitle,
@@ -3076,156 +3259,109 @@ function App() {
     }
   };
 
-  const importGcgBytes = async (
+  const prepareGcgImport = async (
     bytes: ArrayBuffer,
     filename: string,
     sourceUrl?: string,
     prevalidated?: GcgValidationResponse,
-  ): Promise<boolean> => {
-    try {
-      const decoded = decodeGcgBytes(bytes);
-      const localParsed = parseGcg(decoded.text);
-      const localLexiconResolution = resolveLexiconHint(
-        localParsed.lexiconHint,
-      );
-      if (localLexiconResolution === "unsupported")
-        throw new Error("unsupported_lexicon");
-      let validation = prevalidated;
-      if (!validation) {
-        const validationResponse = await fetch(apiUrl("/api/v1/imports/gcg"), {
-          method: "POST",
-          headers: { "content-type": "application/octet-stream" },
-          body: bytes,
-        });
-        if (validationResponse.status === 422)
-          throw new GcgImportError(
-            await apiErrorMessage(
-              validationResponse,
-              "the file is not valid GCG",
-            ),
-          );
-        if (!validationResponse.ok)
-          throw new Error("server_gcg_validation_failed");
-        validation = (await validationResponse.json()) as GcgValidationResponse;
-      }
-      if (!isObject(validation) || !isObject(validation.document))
-        throw new Error("server_gcg_validation_failed");
-      const parsed = validation.document as unknown as GcgImportResult;
-      // A GCG #lexicon line wins; otherwise accept the dictionary the source
-      // page declared (e.g. Cross-Tables "Dictionary: NWL23").
-      const lexiconInfo = (validation as GcgValidationResponse).lexicon;
-      const sourceHint =
-        isObject(lexiconInfo) && typeof lexiconInfo.hint === "string"
-          ? lexiconInfo.hint
-          : null;
-      const effectiveHint = parsed.lexiconHint ?? sourceHint;
-      const lexiconResolution = resolveLexiconHint(effectiveHint);
-      if (lexiconResolution === "unsupported")
-        throw new Error("unsupported_lexicon");
-      let importedLexicon: LexiconId =
-        lexiconResolution === "csw24" ? "csw24" : "nwl23";
-      if (lexiconResolution === "missing") {
-        const choice = await askLexicon();
-        if (!choice) throw new Error("lexicon_not_confirmed");
-        importedLexicon = choice;
-      }
-      if (parsed.finalRack.length > 7) throw new Error("rack_too_large");
-      const importedAt = new Date().toISOString();
-      const matchup =
-        parsed.players.length === 2
-          ? [...parsed.players]
-              .sort((left, right) => left.id - right.id)
-              .map((player) => player.name.replace(/_/g, " "))
-              .join(" vs ")
-          : "";
-      const title =
-        parsed.title.trim() ||
-        matchup ||
-        `Imported GCG · ${filename.slice(0, 40)}`;
-      const state: SessionStateDraft = stateForCells(
-        Object.fromEntries(
-          parsed.board.map((cell) => [
-            cell.row * SIZE + cell.col,
-            { letter: cell.letter, blank: cell.blank },
-          ]),
-        ),
-        {
-          ...DEFAULT_SESSION_STATE,
-          lexiconId: importedLexicon,
-          position: {
-            ...DEFAULT_SESSION_STATE.position,
-            rack: parsed.finalRack,
-            scores: parsed.scores,
-            turn: parsed.turn,
-          },
-          history: parsed.history,
-          metadata: {
-            format: "gcg",
-            title: parsed.title || undefined,
-            description: parsed.description || undefined,
-            players: parsed.players,
-            finalPlayer: parsed.finalPlayer ?? undefined,
-            lexiconHint:
-              effectiveHint ??
-              (importedLexicon === "csw24" ? "CSW24" : "NWL23"),
-            sourceSha256:
-              typeof validation.sourceSha256 === "string"
-                ? validation.sourceSha256
-                : undefined,
-            sourceEncoding:
-              typeof validation.encoding === "string"
-                ? validation.encoding
-                : decoded.encoding,
-            sourceUrl,
-            importedAt,
-            finalPosition: {
-              rack: parsed.finalRack,
-              scores: parsed.scores,
-              turn: parsed.turn,
-            },
-          },
-        },
-      );
-      const lexiconLabel = importedLexicon === "csw24" ? "CSW24" : "NWL2023";
-      const importedMessage =
-        parsed.warnings.length > 0
-          ? `Imported GCG · ${lexiconLabel} · ${parsed.warnings[0]}`
-          : `Imported ${parsed.history.length} records · ${lexiconLabel} · use Replay game to step through and analyze`;
-      pendingOpenStatusRef.current = importedMessage;
-      await createScenario("imported", title, state, {
-        kind: "imported",
-        format: "gcg",
-        filename: filename.slice(0, 128),
-        ...(sourceUrl ? { sourceUrl } : {}),
+  ): Promise<PreparedGcgImport> => {
+    if (bytes.byteLength > MAX_IMPORT_BYTES) throw new Error("file_too_large");
+    const decoded = decodeGcgBytes(bytes);
+    const localParsed = parseGcg(decoded.text);
+    if (resolveLexiconHint(localParsed.lexiconHint) === "unsupported")
+      throw new Error("unsupported_lexicon");
+    let validation = prevalidated;
+    if (!validation) {
+      const validationResponse = await fetch(apiUrl("/api/v1/imports/gcg"), {
+        method: "POST",
+        headers: { "content-type": "application/octet-stream" },
+        body: bytes,
       });
-      setStatus(importedMessage);
-      return true;
-    } catch (error) {
-      if (error instanceof GcgImportError) {
-        setStatus(`GCG import failed · ${error.message}`);
-      } else if (error instanceof GcgParseError) {
-        setStatus(`GCG import failed · ${error.message}`);
-      } else if (error instanceof Error && error.message === "rack_too_large") {
-        setStatus("GCG import failed · final rack has more than 7 tiles");
-      } else if (
-        error instanceof Error &&
-        error.message === "unsupported_lexicon"
-      ) {
-        setStatus(
-          "GCG import blocked · dictionary is not enabled (NWL2023 and CSW24 are supported)",
-        );
-      } else if (
-        error instanceof Error &&
-        error.message === "lexicon_not_confirmed"
-      ) {
-        setStatus("GCG import cancelled · dictionary mapping required");
-      } else {
-        setStatus(
-          `GCG import failed · ${error instanceof TypeError ? "network unavailable" : "the file could not be validated"}`,
+      if (validationResponse.status === 422) {
+        throw new GcgImportError(
+          await apiErrorMessage(
+            validationResponse,
+            "the file is not valid GCG",
+          ),
         );
       }
-      return false;
+      if (!validationResponse.ok)
+        throw new Error("server_gcg_validation_failed");
+      validation = (await validationResponse.json()) as GcgValidationResponse;
     }
+    if (!isObject(validation) || !isObject(validation.document))
+      throw new Error("server_gcg_validation_failed");
+    const parsed = validation.document as unknown as GcgImportResult;
+    const lexiconInfo = validation.lexicon;
+    const sourceHint =
+      isObject(lexiconInfo) && typeof lexiconInfo.hint === "string"
+        ? lexiconInfo.hint
+        : null;
+    const lexiconHint = parsed.lexiconHint ?? sourceHint;
+    const lexiconResolution = resolveLexiconHint(lexiconHint);
+    if (lexiconResolution === "unsupported")
+      throw new Error("unsupported_lexicon");
+    if (parsed.finalRack.length > 7) throw new Error("rack_too_large");
+    const matchup =
+      parsed.players.length === 2
+        ? [...parsed.players]
+            .sort((left, right) => left.id - right.id)
+            .map((player) => player.name.replace(/_/g, " "))
+            .join(" vs ")
+        : "";
+    return {
+      parsed,
+      filename: filename.slice(0, 128),
+      ...(sourceUrl ? { sourceUrl } : {}),
+      sourceSha256:
+        typeof validation.sourceSha256 === "string"
+          ? validation.sourceSha256
+          : undefined,
+      sourceEncoding:
+        typeof validation.encoding === "string"
+          ? validation.encoding
+          : decoded.encoding,
+      lexiconHint,
+      lexiconId:
+        lexiconResolution === "csw24"
+          ? "csw24"
+          : lexiconResolution === "nwl23"
+            ? "nwl23"
+            : null,
+      requiresLexiconChoice: lexiconResolution === "missing",
+      defaultScenarioName: fitScenarioTitle(
+        parsed.title.trim() ||
+          matchup ||
+          `Imported GCG · ${filename.slice(0, 40)}`,
+      ),
+    };
+  };
+
+  const gcgImportErrorCopy = (error: unknown, crossTables = false): string => {
+    const prefix = crossTables
+      ? "Cross-Tables import failed"
+      : "GCG import failed";
+    if (error instanceof GcgImportError || error instanceof GcgParseError) {
+      return `${prefix} · ${error.message}`;
+    }
+    if (error instanceof Error && error.message === "file_too_large") {
+      return `${prefix} · file exceeds the 256 KiB limit`;
+    }
+    if (error instanceof Error && error.message === "rack_too_large") {
+      return `${prefix} · final rack has more than 7 tiles`;
+    }
+    if (error instanceof Error && error.message === "unsupported_lexicon") {
+      return "GCG import blocked · dictionary is not enabled (NWL2023 and CSW24 are supported)";
+    }
+    if (error instanceof TypeError) return `${prefix} · network unavailable`;
+    return `${prefix} · ${crossTables ? "service unavailable or unexpected response" : "the file could not be validated"}`;
+  };
+
+  const acceptPreparedGcgImport = (prepared: PreparedGcgImport) => {
+    setPreparedGcgImport(prepared);
+    setImportNameDraft(prepared.defaultScenarioName);
+    setImportLexiconChoice(prepared.lexiconId);
+    setImportError(null);
   };
 
   const importGcg = async (event: Event) => {
@@ -3234,23 +3370,24 @@ function App() {
     input.value = "";
     if (!file) return;
     if (file.size > MAX_IMPORT_BYTES) {
-      setStatus("GCG import failed · file exceeds the 256 KiB limit");
+      setImportError("GCG import failed · file exceeds the 256 KiB limit");
       return;
     }
-    await importGcgBytes(await file.arrayBuffer(), file.name);
-  };
-
-  const openCrossTablesLink = () => {
+    const requestId = ++importRequestRef.current;
+    setCrossTablesBusy(true);
+    setPreparedGcgImport(null);
+    setImportError(null);
     try {
-      const link = parseCrossTablesUrl(crossTablesUrl);
-      window.open(link.url, "_blank", "noopener,noreferrer");
-      setStatus(`Opened Cross-Tables game ${link.gameId}`);
+      const bytes = await file.arrayBuffer();
+      if (requestId !== importRequestRef.current) return;
+      const prepared = await prepareGcgImport(bytes, file.name);
+      if (requestId === importRequestRef.current)
+        acceptPreparedGcgImport(prepared);
     } catch (error) {
-      setStatus(
-        error instanceof Error
-          ? `Cross-Tables link rejected · ${error.message}`
-          : "Cross-Tables link rejected",
-      );
+      if (requestId === importRequestRef.current)
+        setImportError(gcgImportErrorCopy(error));
+    } finally {
+      if (requestId === importRequestRef.current) setCrossTablesBusy(false);
     }
   };
 
@@ -3259,15 +3396,17 @@ function App() {
     try {
       link = parseCrossTablesUrl(crossTablesUrl);
     } catch (error) {
-      setStatus(
+      setImportError(
         error instanceof Error
           ? `Cross-Tables link rejected · ${error.message}`
           : "Cross-Tables link rejected",
       );
       return;
     }
+    const requestId = ++importRequestRef.current;
     setCrossTablesBusy(true);
-    setStatus(`Fetching Cross-Tables game ${link.gameId}…`);
+    setPreparedGcgImport(null);
+    setImportError(null);
     try {
       const response = await fetch(apiUrl("/api/v1/imports/cross-tables"), {
         method: "POST",
@@ -3275,10 +3414,9 @@ function App() {
         body: JSON.stringify({ url: link.url }),
       });
       if (!response.ok) {
-        setStatus(
-          `Cross-Tables import failed · ${await apiErrorMessage(response, "service unavailable")} · you can download the .gcg and use Import GCG`,
+        throw new Error(
+          `cross_tables:${await apiErrorMessage(response, "service unavailable")}`,
         );
-        return;
       }
       const result = (await response.json()) as GcgValidationResponse & {
         gcgBase64?: unknown;
@@ -3289,20 +3427,110 @@ function App() {
       const gcgBytes = new Uint8Array(binary.length);
       for (let index = 0; index < binary.length; index += 1)
         gcgBytes[index] = binary.charCodeAt(index);
-      const imported = await importGcgBytes(
+      const prepared = await prepareGcgImport(
         gcgBytes.buffer,
         `cross-tables-${link.gameId}.gcg`,
         link.url,
         result,
       );
-      if (imported) setCrossTablesUrl("");
+      if (requestId === importRequestRef.current)
+        acceptPreparedGcgImport(prepared);
     } catch (error) {
-      setStatus(
-        `Cross-Tables import failed · ${error instanceof TypeError ? "network unavailable" : "unexpected response"} · you can download the .gcg and use Import GCG`,
-      );
+      if (requestId === importRequestRef.current) {
+        setImportError(
+          error instanceof Error && error.message.startsWith("cross_tables:")
+            ? `Cross-Tables import failed · ${error.message.slice("cross_tables:".length)}`
+            : gcgImportErrorCopy(error, true),
+        );
+      }
     } finally {
-      setCrossTablesBusy(false);
+      if (requestId === importRequestRef.current) setCrossTablesBusy(false);
     }
+  };
+
+  const createImportedGcgScenario = async () => {
+    const prepared = preparedGcgImport;
+    if (!prepared || scenarioBusy) return;
+    const lexiconId = prepared.lexiconId ?? importLexiconChoice;
+    if (!lexiconId) {
+      setImportError(
+        "Choose the dictionary used for this game before creating the scenario.",
+      );
+      return;
+    }
+    const title = scenarioTitleInput(
+      importNameDraft,
+      prepared.defaultScenarioName,
+    );
+    if (!title) {
+      setImportError(
+        `Scenario names must be 1–${MAX_SCENARIO_TITLE_BYTES} UTF-8 bytes without control characters.`,
+      );
+      return;
+    }
+    const parsed = prepared.parsed;
+    const importedAt = new Date().toISOString();
+    const state: SessionStateDraft = stateForCells(
+      Object.fromEntries(
+        parsed.board.map((cell) => [
+          cell.row * SIZE + cell.col,
+          { letter: cell.letter, blank: cell.blank },
+        ]),
+      ),
+      {
+        ...DEFAULT_SESSION_STATE,
+        lexiconId,
+        position: {
+          ...DEFAULT_SESSION_STATE.position,
+          rack: parsed.finalRack,
+          scores: parsed.scores,
+          turn: parsed.turn,
+        },
+        history: parsed.history,
+        metadata: {
+          format: "gcg",
+          title: parsed.title || undefined,
+          description: parsed.description || undefined,
+          players: parsed.players,
+          finalPlayer: parsed.finalPlayer ?? undefined,
+          lexiconHint:
+            prepared.lexiconHint ?? (lexiconId === "csw24" ? "CSW24" : "NWL23"),
+          sourceSha256: prepared.sourceSha256,
+          sourceEncoding: prepared.sourceEncoding,
+          sourceUrl: prepared.sourceUrl,
+          importedAt,
+          finalPosition: {
+            rack: parsed.finalRack,
+            scores: parsed.scores,
+            turn: parsed.turn,
+          },
+        },
+      },
+    );
+    const lexiconLabel = lexiconId === "csw24" ? "CSW24" : "NWL2023";
+    const importedMessage =
+      parsed.warnings.length > 0
+        ? `Imported GCG · ${lexiconLabel} · ${parsed.warnings[0]}`
+        : `Imported ${parsed.history.length} records · ${lexiconLabel} · use Replay game to step through and analyze`;
+    pendingOpenStatusRef.current = importedMessage;
+    const created = await createScenario("imported", title, state, {
+      kind: "imported",
+      format: "gcg",
+      filename: prepared.filename,
+      ...(prepared.sourceUrl ? { sourceUrl: prepared.sourceUrl } : {}),
+    });
+    if (!created) {
+      pendingOpenStatusRef.current = null;
+      setImportError(
+        "The game was validated, but the scenario could not be opened. Save the current draft and try again.",
+      );
+      return;
+    }
+    setStatus(importedMessage);
+    setWorkspacePanel("list");
+    setPreparedGcgImport(null);
+    setCrossTablesUrl("");
+    setImportError(null);
   };
 
   const pollDeepJob = async (
@@ -3689,15 +3917,16 @@ function App() {
       <main class="workspace">
         <section class="context-strip" aria-label="Session context">
           <div>
-            <span class="eyebrow">SESSION</span>
+            <span class="eyebrow">SCENARIO</span>
             <strong>
               {isReplaying
                 ? "Replay snapshot"
-                : sessionReady
-                  ? "Saved position"
-                  : connectionState === "offline"
-                    ? "Offline draft"
-                    : "Connecting session"}
+                : (activeScenarioTitle ??
+                  (sessionReady
+                    ? "Saved position"
+                    : connectionState === "offline"
+                      ? "Offline draft"
+                      : "Connecting session"))}
             </strong>
           </div>
           <div class="context-stats">
@@ -4517,9 +4746,14 @@ function App() {
               <button
                 class="secondary-button"
                 type="button"
-                onClick={() => importGcgInputRef.current?.click()}
+                onClick={() => {
+                  setSettingsOpen(false);
+                  setScenarioTab("scenarios");
+                  setScenariosOpen(true);
+                  beginImportFlow();
+                }}
               >
-                Import GCG
+                Import game…
               </button>
               <input
                 ref={importInputRef}
@@ -4528,20 +4762,14 @@ function App() {
                 accept="application/json,.json"
                 onChange={(event) => void importPosition(event)}
               />
-              <input
-                ref={importGcgInputRef}
-                class="visually-hidden"
-                type="file"
-                accept="text/plain,.gcg,.txt"
-                onChange={(event) => void importGcg(event)}
-              />
             </div>
             <div class="share-disclosure">
               <p>
                 Links have no scheduled expiry, but per-session limits may
                 remove the oldest automatically. Anyone with a link can create
                 an independent fork; revoking a link does not change existing
-                forks. The link is shown only once when created.
+                forks. The scenario name is visible to recipients and is
+                captured per link.
               </p>
               <button
                 class="text-button"
@@ -4550,45 +4778,12 @@ function App() {
                   setSettingsOpen(false);
                   setScenariosOpen(true);
                   setScenarioTab("shares");
+                  setWorkspacePanel("list");
                 }}
               >
                 Manage share links
               </button>
             </div>
-            <label>
-              Cross-Tables game URL
-              <input
-                type="url"
-                placeholder="https://www.cross-tables.com/annotated.php?u=…"
-                value={crossTablesUrl}
-                onInput={(event) =>
-                  setCrossTablesUrl(event.currentTarget.value)
-                }
-              />
-            </label>
-            <div class="data-actions" aria-label="Cross-Tables actions">
-              <button
-                class="secondary-button"
-                type="button"
-                onClick={() => void importCrossTables()}
-                disabled={crossTablesBusy || crossTablesUrl.trim() === ""}
-              >
-                {crossTablesBusy ? "Fetching public GCG…" : "Import public GCG"}
-              </button>
-              <button
-                class="secondary-button"
-                type="button"
-                onClick={openCrossTablesLink}
-                disabled={crossTablesUrl.trim() === ""}
-              >
-                Open link
-              </button>
-            </div>
-            <p class="scenario-note">
-              Paste a Cross-Tables annotated-game link (annotated.php?u=…). The
-              game and its declared dictionary are fetched and validated by the
-              service; nothing else on the page is used.
-            </p>
             <p class="disclosure">
               <strong>{lexicon.copyright}</strong>
               <br />
@@ -4602,7 +4797,7 @@ function App() {
         <div
           class="drawer-backdrop"
           role="presentation"
-          onClick={() => setScenariosOpen(false)}
+          onClick={closeScenarios}
         >
           <section
             class="settings-drawer scenario-drawer"
@@ -4614,37 +4809,23 @@ function App() {
             <div class="drawer-heading">
               <div>
                 <span class="eyebrow">SCENARIOS & SHARING</span>
-                <h2 id="scenarios-title">Your workspace</h2>
+                <h2 id="scenarios-title">
+                  {workspacePanel === "list"
+                    ? "Your workspace"
+                    : workspacePanel === "import"
+                      ? "Import game"
+                      : workspacePanel === "new"
+                        ? "New game"
+                        : "Blank position"}
+                </h2>
               </div>
               <button
                 class="icon-button"
                 type="button"
-                onClick={() => setScenariosOpen(false)}
+                onClick={closeScenarios}
                 aria-label="Close scenarios"
               >
                 ×
-              </button>
-            </div>
-            <div
-              class="scenario-tabs"
-              role="tablist"
-              aria-label="Workspace lists"
-            >
-              <button
-                type="button"
-                role="tab"
-                aria-selected={scenarioTab === "scenarios"}
-                onClick={() => setScenarioTab("scenarios")}
-              >
-                Scenarios
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={scenarioTab === "shares"}
-                onClick={() => setScenarioTab("shares")}
-              >
-                Share links
               </button>
             </div>
             {orphanedScenarioTitle && (
@@ -4660,291 +4841,554 @@ function App() {
                 </button>
               </p>
             )}
-            {scenarioTab === "scenarios" ? (
+            {workspacePanel === "list" ? (
               <>
-                <div class="scenario-create-actions">
+                <div
+                  class="scenario-tabs"
+                  role="tablist"
+                  aria-label="Workspace lists"
+                >
                   <button
-                    class="primary-button scenario-new-button"
                     type="button"
-                    onClick={createNewGame}
-                    disabled={scenarioBusy || scenarioRemovalBusy}
+                    role="tab"
+                    aria-selected={scenarioTab === "scenarios"}
+                    onClick={() => setScenarioTab("scenarios")}
                   >
-                    New game <small>random opening rack</small>
+                    Scenarios
                   </button>
                   <button
-                    class="secondary-button scenario-new-button"
                     type="button"
-                    onClick={createBlankPosition}
-                    disabled={scenarioBusy || scenarioRemovalBusy}
+                    role="tab"
+                    aria-selected={scenarioTab === "shares"}
+                    onClick={() => setScenarioTab("shares")}
                   >
-                    Blank position
+                    Share links
                   </button>
                 </div>
-                <p class="scenario-note">
-                  New game starts with an empty board and a fresh random rack,
-                  like Quackle. Use Blank position to set up a historical or
-                  hypothetical position manually.
-                </p>
-                <p class="scenario-note">
-                  This browser shows the {MAX_LOCAL_SCENARIOS} most recent
-                  scenarios plus any local drafts and the current one. Removing
-                  a saved copy here does not revoke share links or remove
-                  recipient forks.
-                </p>
-                {undoScenarioDeletion && (
-                  <div class="scenario-undo" role="status">
-                    <span>
-                      Removed “{undoScenarioDeletion.scenario.title}” from this
-                      browser. Shares are unchanged.
-                    </span>
-                    <button
-                      class="text-button"
-                      type="button"
-                      onClick={() => void undoScenarioRemoval()}
-                      disabled={scenarioRemovalBusy}
-                    >
-                      Undo
-                    </button>
-                  </div>
-                )}
-                <div class="scenario-list" aria-label="Recent scenarios">
-                  {displayedScenarios.map((scenario) => (
-                    <div
-                      class={`scenario-item ${scenario.localId === activeLocalId ? "active" : ""}`}
-                      key={scenario.localId}
-                      data-local-scenario-id={scenario.localId}
-                    >
+                {scenarioTab === "scenarios" ? (
+                  <>
+                    <div class="scenario-create-actions">
                       <button
-                        class="scenario-item-open"
+                        class="primary-button scenario-new-button"
                         type="button"
-                        onClick={() => void activateScenario(scenario)}
+                        onClick={() => beginScenarioCreation("new")}
                         disabled={scenarioBusy || scenarioRemovalBusy}
-                        aria-current={
-                          scenario.localId === activeLocalId
-                            ? "true"
-                            : undefined
-                        }
-                        aria-label={`Open scenario ${scenario.title}`}
                       >
-                        <span class="scenario-item-main">
-                          <strong>{scenario.title}</strong>
-                          <small>
-                            {scenarioKindLabel(scenario.kind)} ·{" "}
-                            {scenarioTileCount(scenario.state)} tiles ·{" "}
-                            {scenario.dirty ? "local changes" : "saved"}
-                          </small>
-                        </span>
-                        <span class="scenario-item-meta">
-                          {scenarioTimeLabel(scenario.lastOpenedAt)}
-                          {scenario.localId === activeLocalId
-                            ? " · current"
-                            : ""}
-                        </span>
+                        New game <small>random opening rack</small>
                       </button>
                       <button
-                        class="scenario-remove-button"
+                        class="secondary-button scenario-new-button"
                         type="button"
-                        onClick={() => setScenarioRemovalCandidate(scenario)}
+                        onClick={() => beginScenarioCreation("blank")}
                         disabled={scenarioBusy || scenarioRemovalBusy}
-                        aria-label={`Remove scenario ${scenario.title} from this browser`}
-                        title="Remove from this browser"
                       >
-                        Remove
+                        Blank position
+                      </button>
+                      <button
+                        class="secondary-button scenario-new-button"
+                        type="button"
+                        onClick={beginImportFlow}
+                        disabled={scenarioBusy || scenarioRemovalBusy}
+                      >
+                        Import game
                       </button>
                     </div>
-                  ))}
-                  {displayedScenarios.length === 0 && (
-                    <p class="scenario-empty">No saved scenarios yet.</p>
-                  )}
-                </div>
+                    <p class="scenario-note">
+                      New game starts with an empty board and a fresh random
+                      rack, like Quackle. Use Blank position for a historical or
+                      hypothetical setup. Import GCG files or Cross-Tables games
+                      as separate scenarios.
+                    </p>
+                    <p class="scenario-note">
+                      Scenario names are saved in this browser; game/GCG titles
+                      and server session IDs remain separate. This browser shows
+                      the {MAX_LOCAL_SCENARIOS} most recent scenarios plus local
+                      drafts and the current one.
+                    </p>
+                    {undoScenarioDeletion && (
+                      <div class="scenario-undo" role="status">
+                        <span>
+                          Removed “{undoScenarioDeletion.scenario.title}” from
+                          this browser. Shares are unchanged.
+                        </span>
+                        <button
+                          class="text-button"
+                          type="button"
+                          onClick={() => void undoScenarioRemoval()}
+                          disabled={scenarioRemovalBusy}
+                        >
+                          Undo
+                        </button>
+                      </div>
+                    )}
+                    <div class="scenario-list" aria-label="Recent scenarios">
+                      {displayedScenarios.map((scenario) => (
+                        <div
+                          class={`scenario-item ${scenario.localId === activeLocalId ? "active" : ""}`}
+                          key={scenario.localId}
+                          data-local-scenario-id={scenario.localId}
+                        >
+                          <button
+                            class="scenario-item-open"
+                            type="button"
+                            onClick={() => void activateScenario(scenario)}
+                            disabled={scenarioBusy || scenarioRemovalBusy}
+                            aria-current={
+                              scenario.localId === activeLocalId
+                                ? "true"
+                                : undefined
+                            }
+                            aria-label={`Open scenario ${scenario.title}`}
+                          >
+                            <span class="scenario-item-main">
+                              <strong>{scenario.title}</strong>
+                              <small>
+                                {scenarioKindLabel(scenario.kind)} ·{" "}
+                                {scenarioTileCount(scenario.state)} tiles ·{" "}
+                                {scenario.dirty ? "local changes" : "saved"}
+                              </small>
+                            </span>
+                            <span class="scenario-item-meta">
+                              {scenarioTimeLabel(scenario.lastOpenedAt)}
+                              {scenario.localId === activeLocalId
+                                ? " · current"
+                                : ""}
+                            </span>
+                          </button>
+                          <button
+                            class="scenario-rename-button"
+                            type="button"
+                            onClick={() => openRenameScenario(scenario)}
+                            disabled={scenarioBusy || scenarioRemovalBusy}
+                            aria-label={`Rename scenario ${scenario.title}`}
+                          >
+                            Rename
+                          </button>
+                          <button
+                            class="scenario-remove-button"
+                            type="button"
+                            onClick={() =>
+                              setScenarioRemovalCandidate(scenario)
+                            }
+                            disabled={scenarioBusy || scenarioRemovalBusy}
+                            aria-label={`Remove scenario ${scenario.title} from this browser`}
+                            title="Remove from this browser"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      ))}
+                      {displayedScenarios.length === 0 && (
+                        <p class="scenario-empty">No saved scenarios yet.</p>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <section
+                    class="share-manager"
+                    aria-label="Share link management"
+                  >
+                    <p class="scenario-note">
+                      Links have no scheduled expiry, but per-session quotas may
+                      remove the oldest automatically. New links show the
+                      current scenario name to recipients; later renames do not
+                      change existing links. This manager stores source-session
+                      handles only—not bearer URLs, share tokens, or capability
+                      cookies. Each source's owner cookie renews when that
+                      source is successfully checked/used and expires after 30
+                      days without a request to that source; the link may still
+                      work if owner access is unavailable.
+                    </p>
+                    <div class="share-links-heading">
+                      <strong>Known share sources</strong>
+                      <button
+                        class="text-button"
+                        type="button"
+                        onClick={() => void refreshAllShareSources()}
+                        disabled={
+                          shareSources.length === 0 ||
+                          shareSourcesLoading ||
+                          shareSourcesRefreshing ||
+                          shareSourceAction !== null
+                        }
+                      >
+                        {shareSourcesLoading
+                          ? "Loading…"
+                          : shareSourcesRefreshing
+                            ? "Checking…"
+                            : "Refresh all"}
+                      </button>
+                    </div>
+                    <div class="share-source-list">
+                      {displayedShareSources.map((source) => {
+                        const view = shareSourceViews[source.sessionId] ?? {
+                          status: "unchecked" as const,
+                          links: [],
+                          notices: [],
+                        };
+                        const actionPending =
+                          shareSourceAction?.startsWith(
+                            `${source.sessionId}:`,
+                          ) ?? false;
+                        const viewLabel =
+                          view.status === "unchecked"
+                            ? "Not checked"
+                            : view.status === "checking"
+                              ? "Checking…"
+                              : view.status === "ready"
+                                ? `${view.links.length} active ${view.links.length === 1 ? "link" : "links"}`
+                                : view.status === "offline"
+                                  ? "Offline · link status unknown"
+                                  : "Owner access unavailable · link status unknown";
+                        return (
+                          <article
+                            class="share-source-card"
+                            key={source.sessionId}
+                          >
+                            <div class="share-source-heading">
+                              <div>
+                                <strong>{source.title}</strong>
+                                <small>
+                                  {source.localId
+                                    ? "Saved scenario"
+                                    : "Source scenario removed from this browser"}{" "}
+                                  · {viewLabel}
+                                  {view.checkedAt
+                                    ? ` · checked ${scenarioTimeLabel(view.checkedAt)}`
+                                    : ""}
+                                </small>
+                              </div>
+                              <div class="share-source-actions">
+                                <button
+                                  class="text-button"
+                                  type="button"
+                                  onClick={() => void checkShareSource(source)}
+                                  disabled={
+                                    actionPending || view.status === "checking"
+                                  }
+                                >
+                                  {view.status === "checking"
+                                    ? "Checking…"
+                                    : view.status === "ready"
+                                      ? "Refresh"
+                                      : "Check"}
+                                </button>
+                                {view.status === "ready" && (
+                                  <button
+                                    class="text-button"
+                                    type="button"
+                                    onClick={() =>
+                                      void createShareFromManager(source)
+                                    }
+                                    disabled={actionPending}
+                                  >
+                                    {shareSourceAction ===
+                                    `${source.sessionId}:create`
+                                      ? "Creating…"
+                                      : view.links.length > 0
+                                        ? "Create another link"
+                                        : "Create link"}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                            {!source.localId && view.status === "ready" && (
+                              <p class="share-manager-warning">
+                                Creating a link shares the source session’s last
+                                saved server snapshot. It cannot recover an
+                                older URL or include unsaved changes from the
+                                removed local scenario.
+                              </p>
+                            )}
+                            {(view.status === "offline" ||
+                              view.status === "unavailable") && (
+                              <p class="share-manager-warning">
+                                The source could not be authorized. The share
+                                link may still work; reconnect to verify or
+                                revoke it.
+                              </p>
+                            )}
+                            {view.notices.map((notice) => (
+                              <div
+                                class="share-link-notice"
+                                key={notice.shareId}
+                                role="status"
+                              >
+                                <div>
+                                  <strong>Link removed automatically</strong>
+                                  <small>
+                                    Revision {notice.sourceRevision} ·{" "}
+                                    {notice.reason === "storage_limit"
+                                      ? "storage pressure"
+                                      : "active-link limit"}{" "}
+                                    · created{" "}
+                                    {scenarioTimeLabel(notice.createdAt)}
+                                  </small>
+                                </div>
+                                <button
+                                  class="text-button"
+                                  type="button"
+                                  onClick={() =>
+                                    void dismissShareNotice(
+                                      source.sessionId,
+                                      notice.shareId,
+                                    )
+                                  }
+                                  disabled={actionPending}
+                                >
+                                  {shareSourceAction ===
+                                  `${source.sessionId}:${notice.shareId}`
+                                    ? "Dismissing…"
+                                    : "Dismiss"}
+                                </button>
+                              </div>
+                            ))}
+                            {view.links.map((share) => (
+                              <div class="share-link-row" key={share.shareId}>
+                                <div>
+                                  <strong>
+                                    {share.shareLabel ?? "Shared scenario"}
+                                  </strong>
+                                  <small>
+                                    Revision {share.sourceRevision} · No
+                                    scheduled expiry · {share.useCount}{" "}
+                                    {share.useCount === 1 ? "fork" : "forks"} ·
+                                    created {scenarioTimeLabel(share.createdAt)}
+                                  </small>
+                                </div>
+                                <button
+                                  class="text-button destructive-text-button"
+                                  type="button"
+                                  onClick={() =>
+                                    setPendingShareRevoke({
+                                      sourceSessionId: source.sessionId,
+                                      shareId: share.shareId,
+                                      title: share.shareLabel ?? source.title,
+                                    })
+                                  }
+                                  disabled={actionPending}
+                                >
+                                  Revoke
+                                </button>
+                              </div>
+                            ))}
+                          </article>
+                        );
+                      })}
+                      {displayedShareSources.length === 0 &&
+                        !shareSourcesLoading && (
+                          <p class="scenario-empty">
+                            {shareSources.length > 0
+                              ? "No active links in the checked sources. Create a new link from a source here or from scenario settings."
+                              : "No known share sources. Create a share link from a scenario to manage it here."}
+                          </p>
+                        )}
+                    </div>
+                  </section>
+                )}
               </>
             ) : (
-              <section class="share-manager" aria-label="Share link management">
-                <p class="scenario-note">
-                  Links have no scheduled expiry, but per-session quotas may
-                  remove the oldest automatically. This manager stores
-                  source-session handles only—not bearer URLs, share tokens, or
-                  capability cookies. Each source's owner cookie renews when
-                  that source is successfully checked/used and expires after 30
-                  days without a request to that source; the link may still work
-                  if owner access is unavailable.
-                </p>
-                <div class="share-links-heading">
-                  <strong>Known share sources</strong>
-                  <button
-                    class="text-button"
-                    type="button"
-                    onClick={() => void refreshAllShareSources()}
-                    disabled={
-                      shareSources.length === 0 ||
-                      shareSourcesLoading ||
-                      shareSourcesRefreshing ||
-                      shareSourceAction !== null
-                    }
-                  >
-                    {shareSourcesLoading
-                      ? "Loading…"
-                      : shareSourcesRefreshing
-                        ? "Checking…"
-                        : "Refresh all"}
-                  </button>
-                </div>
-                <div class="share-source-list">
-                  {displayedShareSources.map((source) => {
-                    const view = shareSourceViews[source.sessionId] ?? {
-                      status: "unchecked" as const,
-                      links: [],
-                      notices: [],
-                    };
-                    const actionPending =
-                      shareSourceAction?.startsWith(`${source.sessionId}:`) ??
-                      false;
-                    const viewLabel =
-                      view.status === "unchecked"
-                        ? "Not checked"
-                        : view.status === "checking"
-                          ? "Checking…"
-                          : view.status === "ready"
-                            ? `${view.links.length} active ${view.links.length === 1 ? "link" : "links"}`
-                            : view.status === "offline"
-                              ? "Offline · link status unknown"
-                              : "Owner access unavailable · link status unknown";
-                    return (
-                      <article class="share-source-card" key={source.sessionId}>
-                        <div class="share-source-heading">
-                          <div>
-                            <strong>{source.title}</strong>
-                            <small>
-                              {source.localId
-                                ? "Saved scenario"
-                                : "Source scenario removed from this browser"}{" "}
-                              · {viewLabel}
-                              {view.checkedAt
-                                ? ` · checked ${scenarioTimeLabel(view.checkedAt)}`
-                                : ""}
-                            </small>
-                          </div>
-                          <div class="share-source-actions">
-                            <button
-                              class="text-button"
-                              type="button"
-                              onClick={() => void checkShareSource(source)}
-                              disabled={
-                                actionPending || view.status === "checking"
-                              }
-                            >
-                              {view.status === "checking"
-                                ? "Checking…"
-                                : view.status === "ready"
-                                  ? "Refresh"
-                                  : "Check"}
-                            </button>
-                            {view.status === "ready" && (
-                              <button
-                                class="text-button"
-                                type="button"
-                                onClick={() =>
-                                  void createShareFromManager(source)
-                                }
-                                disabled={actionPending}
-                              >
-                                {shareSourceAction ===
-                                `${source.sessionId}:create`
-                                  ? "Creating…"
-                                  : view.links.length > 0
-                                    ? "Create another link"
-                                    : "Create link"}
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                        {!source.localId && view.status === "ready" && (
-                          <p class="share-manager-warning">
-                            Creating a link shares the source session’s last
-                            saved server snapshot. It cannot recover an older
-                            URL or include unsaved changes from the removed
-                            local scenario.
-                          </p>
-                        )}
-                        {(view.status === "offline" ||
-                          view.status === "unavailable") && (
-                          <p class="share-manager-warning">
-                            The source could not be authorized. The share link
-                            may still work; reconnect to verify or revoke it.
-                          </p>
-                        )}
-                        {view.notices.map((notice) => (
-                          <div
-                            class="share-link-notice"
-                            key={notice.shareId}
-                            role="status"
-                          >
-                            <div>
-                              <strong>Link removed automatically</strong>
-                              <small>
-                                Revision {notice.sourceRevision} ·{" "}
-                                {notice.reason === "storage_limit"
-                                  ? "storage pressure"
-                                  : "active-link limit"}{" "}
-                                · created {scenarioTimeLabel(notice.createdAt)}
-                              </small>
-                            </div>
-                            <button
-                              class="text-button"
-                              type="button"
-                              onClick={() =>
-                                void dismissShareNotice(
-                                  source.sessionId,
-                                  notice.shareId,
-                                )
-                              }
-                              disabled={actionPending}
-                            >
-                              {shareSourceAction ===
-                              `${source.sessionId}:${notice.shareId}`
-                                ? "Dismissing…"
-                                : "Dismiss"}
-                            </button>
-                          </div>
-                        ))}
-                        {view.links.map((share) => (
-                          <div class="share-link-row" key={share.shareId}>
-                            <div>
-                              <strong>Revision {share.sourceRevision}</strong>
-                              <small>
-                                No scheduled expiry · {share.useCount}{" "}
-                                {share.useCount === 1 ? "fork" : "forks"} ·
-                                created {scenarioTimeLabel(share.createdAt)}
-                              </small>
-                            </div>
-                            <button
-                              class="text-button destructive-text-button"
-                              type="button"
-                              onClick={() =>
-                                setPendingShareRevoke({
-                                  sourceSessionId: source.sessionId,
-                                  shareId: share.shareId,
-                                  title: source.title,
-                                })
-                              }
-                              disabled={actionPending}
-                            >
-                              Revoke
-                            </button>
-                          </div>
-                        ))}
-                      </article>
-                    );
-                  })}
-                  {displayedShareSources.length === 0 &&
-                    !shareSourcesLoading && (
-                      <p class="scenario-empty">
-                        {shareSources.length > 0
-                          ? "No active links in the checked sources. Create a new link from a source here or from scenario settings."
-                          : "No known share sources. Create a share link from a scenario to manage it here."}
+              <section class="workspace-composer" aria-live="polite">
+                <button
+                  class="text-button composer-back"
+                  type="button"
+                  onClick={cancelWorkspacePanel}
+                >
+                  ← Back to scenarios
+                </button>
+                {workspacePanel === "new" || workspacePanel === "blank" ? (
+                  <>
+                    <h3>
+                      {workspacePanel === "new"
+                        ? "Start a new game"
+                        : "Set up a blank position"}
+                    </h3>
+                    <p class="scenario-note">
+                      {workspacePanel === "new"
+                        ? "A fresh board and random opening rack, saved as a new scenario."
+                        : "A fresh board and empty rack for a historical or hypothetical position."}{" "}
+                      Your current scenario stays available.
+                    </p>
+                    <label>
+                      Scenario name
+                      <input
+                        type="text"
+                        maxLength={MAX_SCENARIO_TITLE_BYTES}
+                        value={scenarioNameDraft}
+                        onInput={(event) => {
+                          setScenarioNameDraft(event.currentTarget.value);
+                          setScenarioNameError(null);
+                        }}
+                        aria-describedby="scenario-name-help"
+                      />
+                    </label>
+                    <p id="scenario-name-help" class="scenario-note">
+                      Optional and browser-local. Leave the suggested name or
+                      enter up to {MAX_SCENARIO_TITLE_BYTES} UTF-8 bytes; the
+                      game title is separate.
+                    </p>
+                    {scenarioNameError && (
+                      <p class="import-error" role="alert">
+                        {scenarioNameError}
                       </p>
                     )}
-                </div>
+                    <button
+                      class="primary-button workspace-create-button"
+                      type="button"
+                      onClick={() => void createNamedScenario()}
+                      disabled={scenarioBusy}
+                    >
+                      {scenarioBusy
+                        ? "Creating…"
+                        : `Create ${workspacePanel === "new" ? "game" : "blank position"}`}
+                    </button>
+                  </>
+                ) : (
+                  <section class="import-workflow" aria-label="Import game">
+                    <p class="scenario-note">
+                      Choose a GCG file or a Cross-Tables annotated-game URL.
+                      The game is validated before a new scenario is created;
+                      cancelling leaves your current scenario unchanged.
+                    </p>
+                    {!preparedGcgImport && (
+                      <>
+                        <input
+                          ref={importGcgInputRef}
+                          class="visually-hidden"
+                          type="file"
+                          accept="text/plain,.gcg,.txt"
+                          onChange={(event) => void importGcg(event)}
+                        />
+                        <button
+                          class="secondary-button import-file-button"
+                          type="button"
+                          onClick={() => importGcgInputRef.current?.click()}
+                          disabled={crossTablesBusy}
+                        >
+                          Choose GCG file
+                        </button>
+                        <label>
+                          Cross-Tables game URL
+                          <input
+                            type="url"
+                            placeholder="https://www.cross-tables.com/annotated.php?u=…"
+                            value={crossTablesUrl}
+                            onInput={(event) => {
+                              setCrossTablesUrl(event.currentTarget.value);
+                              setImportError(null);
+                            }}
+                            disabled={crossTablesBusy}
+                          />
+                        </label>
+                        <button
+                          class="secondary-button import-file-button"
+                          type="button"
+                          onClick={() => void importCrossTables()}
+                          disabled={
+                            crossTablesBusy || crossTablesUrl.trim() === ""
+                          }
+                        >
+                          {crossTablesBusy
+                            ? "Fetching and validating…"
+                            : "Fetch and review game"}
+                        </button>
+                      </>
+                    )}
+                    {crossTablesBusy && (
+                      <p class="import-progress" role="status">
+                        Fetching and validating game data…
+                      </p>
+                    )}
+                    {preparedGcgImport && (
+                      <div class="import-review">
+                        <h3>Review imported game</h3>
+                        <p class="scenario-note">
+                          {preparedGcgImport.parsed.title ||
+                            preparedGcgImport.filename}{" "}
+                          · {preparedGcgImport.parsed.history.length} records ·{" "}
+                          {preparedGcgImport.sourceEncoding}
+                        </p>
+                        {preparedGcgImport.requiresLexiconChoice ? (
+                          <label>
+                            Which dictionary was this game played with?
+                            <select
+                              value={importLexiconChoice ?? ""}
+                              onChange={(event) =>
+                                setImportLexiconChoice(
+                                  event.currentTarget.value === ""
+                                    ? null
+                                    : (event.currentTarget.value as LexiconId),
+                                )
+                              }
+                            >
+                              <option value="">Choose a dictionary</option>
+                              <option value="nwl23">NWL2023</option>
+                              <option value="csw24">CSW24</option>
+                            </select>
+                          </label>
+                        ) : (
+                          <p class="scenario-note">
+                            Dictionary identified:{" "}
+                            {
+                              LEXICON_DETAILS[
+                                preparedGcgImport.lexiconId ?? "nwl23"
+                              ].displayName
+                            }
+                          </p>
+                        )}
+                        <label>
+                          Scenario name
+                          <input
+                            type="text"
+                            maxLength={MAX_SCENARIO_TITLE_BYTES}
+                            value={importNameDraft}
+                            onInput={(event) => {
+                              setImportNameDraft(event.currentTarget.value);
+                              setImportError(null);
+                            }}
+                          />
+                        </label>
+                        <p class="scenario-note">
+                          The GCG game title and player details remain
+                          unchanged. This name is only this browser’s scenario
+                          label.
+                        </p>
+                        <button
+                          class="secondary-button import-file-button"
+                          type="button"
+                          onClick={() => {
+                            setPreparedGcgImport(null);
+                            setImportNameDraft("");
+                            setImportLexiconChoice(null);
+                            setImportError(null);
+                          }}
+                          disabled={scenarioBusy}
+                        >
+                          Choose another source
+                        </button>
+                        <button
+                          class="primary-button workspace-create-button"
+                          type="button"
+                          onClick={() => void createImportedGcgScenario()}
+                          disabled={
+                            scenarioBusy ||
+                            (preparedGcgImport.requiresLexiconChoice &&
+                              !importLexiconChoice)
+                          }
+                        >
+                          {scenarioBusy
+                            ? "Creating…"
+                            : "Create imported scenario"}
+                        </button>
+                      </div>
+                    )}
+                    {importError && (
+                      <p class="import-error" role="alert">
+                        {importError}
+                      </p>
+                    )}
+                  </section>
+                )}
               </section>
             )}
           </section>
@@ -5017,6 +5461,73 @@ function App() {
           </section>
         </div>
       )}
+      {renameCandidate && (
+        <div
+          class="drawer-backdrop choice-backdrop"
+          role="presentation"
+          onClick={() => !renameBusy && setRenameCandidate(null)}
+        >
+          <section
+            class="blank-picker confirm-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="scenario-rename-title"
+            aria-describedby="scenario-rename-copy"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div class="drawer-heading">
+              <div>
+                <span class="eyebrow">BROWSER-LOCAL NAME</span>
+                <h2 id="scenario-rename-title">Rename scenario</h2>
+              </div>
+              <button
+                class="icon-button"
+                type="button"
+                onClick={() => setRenameCandidate(null)}
+                aria-label="Cancel rename"
+                disabled={renameBusy}
+              >
+                ×
+              </button>
+            </div>
+            <p id="scenario-rename-copy" class="about-lede">
+              This changes only the name shown in this browser and its Share
+              links manager label. It does not change the game/GCG title,
+              session ID, existing share URLs, or saved share snapshots. New
+              share links capture this name for recipients.
+            </p>
+            <label>
+              Scenario name
+              <input
+                type="text"
+                maxLength={MAX_SCENARIO_TITLE_BYTES}
+                value={renameNameDraft}
+                onInput={(event) =>
+                  setRenameNameDraft(event.currentTarget.value)
+                }
+              />
+            </label>
+            <div class="action-row confirm-actions">
+              <button
+                class="secondary-button"
+                type="button"
+                onClick={() => setRenameCandidate(null)}
+                disabled={renameBusy}
+              >
+                Cancel
+              </button>
+              <button
+                class="primary-button"
+                type="button"
+                onClick={() => void submitScenarioRename()}
+                disabled={renameBusy}
+              >
+                {renameBusy ? "Saving…" : "Save name"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
       {pendingShareRevoke && (
         <div
           class="drawer-backdrop choice-backdrop"
@@ -5075,7 +5586,10 @@ function App() {
         <div
           class="drawer-backdrop choice-backdrop"
           role="presentation"
-          onClick={() => setShareCreationUrl(null)}
+          onClick={() => {
+            setShareCreationUrl(null);
+            setShareCreationLabel(null);
+          }}
         >
           <section
             class="blank-picker confirm-dialog"
@@ -5093,7 +5607,10 @@ function App() {
               <button
                 class="icon-button"
                 type="button"
-                onClick={() => setShareCreationUrl(null)}
+                onClick={() => {
+                  setShareCreationUrl(null);
+                  setShareCreationLabel(null);
+                }}
                 aria-label="Close share link"
               >
                 ×
@@ -5103,6 +5620,11 @@ function App() {
               Anyone with this URL can create an independent copy. This one-time
               URL is shown only now and is not saved in this browser’s manager;
               creating another link later makes a different URL.
+            </p>
+            <p class="share-manager-warning">
+              Recipients will see “{shareCreationLabel ?? "Shared scenario"}”.
+              This name is saved with this link’s snapshot; renaming the local
+              scenario later will not change this link or existing forks.
             </p>
             <label class="share-url-label">
               Copy and keep this link
@@ -5119,7 +5641,10 @@ function App() {
               <button
                 class="secondary-button"
                 type="button"
-                onClick={() => setShareCreationUrl(null)}
+                onClick={() => {
+                  setShareCreationUrl(null);
+                  setShareCreationLabel(null);
+                }}
               >
                 Done
               </button>
@@ -5176,57 +5701,7 @@ function App() {
           </section>
         </div>
       )}
-      {lexiconPrompt && (
-        <div
-          class="drawer-backdrop choice-backdrop"
-          role="presentation"
-          onClick={() => lexiconPrompt(null)}
-        >
-          <section
-            class="blank-picker"
-            role="alertdialog"
-            aria-modal="true"
-            aria-labelledby="lexicon-prompt-title"
-            aria-describedby="lexicon-prompt-body"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div class="drawer-heading">
-              <div>
-                <span class="eyebrow">GCG IMPORT</span>
-                <h2 id="lexicon-prompt-title">Which dictionary?</h2>
-              </div>
-              <button
-                class="icon-button"
-                type="button"
-                onClick={() => lexiconPrompt(null)}
-                aria-label="Cancel import"
-              >
-                ×
-              </button>
-            </div>
-            <p id="lexicon-prompt-body" class="about-lede">
-              This GCG file does not name its dictionary. Choose the one the
-              game was played with so words are validated correctly.
-            </p>
-            <div class="data-actions">
-              <button
-                class="primary-button"
-                type="button"
-                onClick={() => lexiconPrompt("nwl23")}
-              >
-                NWL2023
-              </button>
-              <button
-                class="secondary-button"
-                type="button"
-                onClick={() => lexiconPrompt("csw24")}
-              >
-                CSW24
-              </button>
-            </div>
-          </section>
-        </div>
-      )}
+
       {aboutOpen && (
         <div
           class="drawer-backdrop"

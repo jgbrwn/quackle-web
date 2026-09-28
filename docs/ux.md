@@ -80,6 +80,12 @@ ideas without copying the fixed Qt layout:
   snapshot, including after the last active link is revoked; an old one-time
   bearer URL is never recovered. Share fragments are removed before redemption
   starts, preventing reloads from accidentally creating another fork.
+- The Scenarios tab offers **New game**, **Blank position**, and **Import game**
+  as sibling ways to start a scenario. GCG file and Cross-Tables URL imports are
+  validated before creating a separate scenario; a dictionary choice appears
+  when the game does not identify one. Scenario names are browser-local and
+  editable; each new share link captures the name separately for recipients,
+  without changing GCG title metadata or existing links/forks.
 
 Reference behaviors were taken from pinned Quackle sources such as
 `quacker/newgame.cpp`, `quacker/graphicalboard.cpp`, `quacker/rackdisplay.cpp`,

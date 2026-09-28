@@ -10,6 +10,8 @@ export interface ScenarioRecord {
   localId: string;
   /** Local-only generation counter; never sent to the Worker or exported. */
   localGeneration?: number;
+  /** Independent local-name version used to preserve renames across autosaves. */
+  localTitleRevision?: number;
   sessionId: string | null;
   kind: ScenarioKind;
   title: string;
@@ -45,6 +47,7 @@ export interface DeletedScenario {
 export type ScenarioStoreEvent =
   | { type: "removed"; localIds: string[] }
   | { type: "restored"; localId: string }
+  | { type: "renamed"; localId: string; title: string; titleRevision: number }
   | { type: "sources-changed"; sessionId: string };
 
 const DATABASE_NAME = "quackle-web-drafts";
@@ -60,6 +63,7 @@ const SCENARIO_TOMBSTONE_PREFIX = "scenario-deleted:";
 const SCENARIO_GENERATION_PREFIX = "scenario-generation:";
 const SCENARIO_CHANNEL_NAME = "quackle-web-scenarios";
 export const MAX_LOCAL_SCENARIOS = 100;
+export const MAX_SCENARIO_TITLE_BYTES = 128;
 
 function now(): string {
   return new Date().toISOString();
@@ -73,6 +77,18 @@ export function newScenarioId(): string {
 
 function validSessionId(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9_-]{20,128}$/.test(value);
+}
+
+export function validateScenarioTitle(value: string): string | null {
+  const title = value.trim();
+  if (
+    title.length === 0 ||
+    /[\u0000-\u001f\u007f-\u009f]/u.test(title) ||
+    new TextEncoder().encode(title).byteLength > MAX_SCENARIO_TITLE_BYTES
+  ) {
+    return null;
+  }
+  return title;
 }
 
 function tombstoneKey(localId: string): string {
@@ -113,7 +129,9 @@ export function subscribeToScenarioEvents(
   channel.onmessage = (event: MessageEvent<ScenarioStoreEvent>) => {
     if (
       event.data &&
-      ["removed", "restored", "sources-changed"].includes(event.data.type)
+      ["removed", "restored", "renamed", "sources-changed"].includes(
+        event.data.type,
+      )
     ) {
       listener(event.data);
     }
@@ -411,7 +429,10 @@ export async function rememberShareSource(
             : null;
         store.put({
           sessionId,
-          title: title.slice(0, 128),
+          title: (attachedLocalId && localScenario
+            ? localScenario.title
+            : title
+          ).slice(0, 128),
           localId: attachedLocalId,
           firstSeenAt: existing?.firstSeenAt ?? now(),
           lastSeenAt: now(),
@@ -459,6 +480,117 @@ export async function rememberShareSource(
       transaction.oncomplete = () => {
         publishScenarioEvent({ type: "sources-changed", sessionId });
         resolve();
+      };
+    });
+  });
+}
+
+/**
+ * Rename only the browser-local label. Game/session state and its revision are
+ * untouched; share-source labels are updated only while still associated.
+ */
+export async function renameScenario(
+  localId: string,
+  title: string,
+  expectedTitleRevision?: number,
+): Promise<ScenarioRecord | null> {
+  const validTitle = validateScenarioTitle(title);
+  if (!validTitle) throw new Error("invalid_scenario_title");
+  return withDatabase(async (database) => {
+    return new Promise<ScenarioRecord | null>((resolve, reject) => {
+      const transaction = database.transaction(
+        [SCENARIO_STORE_NAME, META_STORE_NAME, SHARE_SOURCE_STORE_NAME],
+        "readwrite",
+      );
+      const scenarios = transaction.objectStore(SCENARIO_STORE_NAME);
+      const meta = transaction.objectStore(META_STORE_NAME);
+      const shareSources = transaction.objectStore(SHARE_SOURCE_STORE_NAME);
+      const scenarioRequest = scenarios.get(localId);
+      const tombstoneRequest = meta.get(tombstoneKey(localId));
+      const generationRequest = meta.get(generationKey(localId));
+      let scenario: ScenarioRecord | undefined;
+      let tombstone: unknown;
+      let storedGeneration = 0;
+      let checksRemaining = 3;
+      let renamed: ScenarioRecord | null = null;
+      let changed = false;
+      const finish = () => {
+        checksRemaining -= 1;
+        if (checksRemaining !== 0) return;
+        if (
+          !scenario ||
+          tombstone ||
+          (scenario.localGeneration ?? 0) < storedGeneration ||
+          (expectedTitleRevision !== undefined &&
+            (scenario.localTitleRevision ?? 0) !== expectedTitleRevision)
+        )
+          return;
+        const currentTitleRevision = scenario.localTitleRevision ?? 0;
+        if (scenario.title === validTitle) {
+          renamed = scenario;
+          return;
+        }
+        renamed = {
+          ...scenario,
+          title: validTitle,
+          localTitleRevision: currentTitleRevision + 1,
+          savedAt: now(),
+        };
+        changed = true;
+        scenarios.put(renamed);
+        if (validSessionId(scenario.sessionId)) {
+          const sourceRequest = shareSources.get(scenario.sessionId);
+          sourceRequest.onsuccess = () => {
+            const source = sourceRequest.result as
+              ShareSourceRecord | undefined;
+            if (source?.localId === localId) {
+              shareSources.put({
+                ...source,
+                title: validTitle,
+                lastSeenAt: now(),
+              });
+            }
+          };
+          sourceRequest.onerror = () =>
+            reject(sourceRequest.error ?? new Error("indexeddb_read_failed"));
+        }
+      };
+      scenarioRequest.onsuccess = () => {
+        scenario = scenarioRequest.result as ScenarioRecord | undefined;
+        finish();
+      };
+      scenarioRequest.onerror = () =>
+        reject(scenarioRequest.error ?? new Error("indexeddb_read_failed"));
+      tombstoneRequest.onsuccess = () => {
+        tombstone = tombstoneRequest.result;
+        finish();
+      };
+      tombstoneRequest.onerror = () =>
+        reject(tombstoneRequest.error ?? new Error("indexeddb_read_failed"));
+      generationRequest.onsuccess = () => {
+        const value = generationRequest.result as
+          { generation?: unknown } | undefined;
+        storedGeneration =
+          typeof value?.generation === "number" &&
+          Number.isInteger(value.generation)
+            ? value.generation
+            : 0;
+        finish();
+      };
+      generationRequest.onerror = () =>
+        reject(generationRequest.error ?? new Error("indexeddb_read_failed"));
+      transaction.onerror = () =>
+        reject(transaction.error ?? new Error("indexeddb_write_failed"));
+      transaction.oncomplete = () => {
+        if (changed && renamed) {
+          publishScenarioEvent({
+            type: "renamed",
+            localId,
+            title: renamed.title,
+            titleRevision: renamed.localTitleRevision ?? 0,
+          });
+        }
+        resolve(renamed);
       };
     });
   });
@@ -634,11 +766,13 @@ export async function saveScenario(
       const shareSources = transaction.objectStore(SHARE_SOURCE_STORE_NAME);
       const tombstoneRequest = meta.get(tombstoneKey(scenario.localId));
       const generationRequest = meta.get(generationKey(scenario.localId));
+      const existingRequest = scenarios.get(scenario.localId);
       const activeRequest = makeActive ? null : meta.get(ACTIVE_SCENARIO_KEY);
       let tombstone: unknown;
       let storedGeneration = 0;
+      let existingScenario: ScenarioRecord | undefined;
       let activeLocalId: string | null = makeActive ? scenario.localId : null;
-      let checksRemaining = activeRequest ? 3 : 2;
+      let checksRemaining = activeRequest ? 4 : 3;
       let saved = false;
       const prunedLocalIds: string[] = [];
 
@@ -650,7 +784,18 @@ export async function saveScenario(
         const generation =
           Math.max(localGeneration, storedGeneration) +
           (advanceLocalGeneration ? 1 : 0);
-        const savedScenario = { ...scenario, localGeneration: generation };
+        const storedTitleRevision = existingScenario?.localTitleRevision ?? 0;
+        const incomingTitleRevision = scenario.localTitleRevision ?? 0;
+        const savedScenario = {
+          ...scenario,
+          ...(storedTitleRevision > incomingTitleRevision
+            ? {
+                title: existingScenario!.title,
+                localTitleRevision: storedTitleRevision,
+              }
+            : { localTitleRevision: incomingTitleRevision }),
+          localGeneration: generation,
+        };
         scenarios.put(savedScenario);
         meta.put({ generation }, generationKey(scenario.localId));
         if (makeActive)
@@ -746,6 +891,12 @@ export async function saveScenario(
       };
       generationRequest.onerror = () =>
         reject(generationRequest.error ?? new Error("indexeddb_read_failed"));
+      existingRequest.onsuccess = () => {
+        existingScenario = existingRequest.result as ScenarioRecord | undefined;
+        prepareSave();
+      };
+      existingRequest.onerror = () =>
+        reject(existingRequest.error ?? new Error("indexeddb_read_failed"));
       activeRequest?.addEventListener("success", () => {
         const active = activeRequest.result as
           { localId?: unknown } | undefined;

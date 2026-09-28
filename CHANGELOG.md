@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Scenarios have editable browser-local names, and **Import game** is a first-
+  class Scenarios action for GCG files and Cross-Tables URLs. Imports are
+  validated and named before creating a new scenario.
+- New share links capture the current scenario name as a separate,
+  recipient-visible label. Renaming later changes future links only; existing
+  URLs, snapshots, and recipient forks remain unchanged.
 - Scenarios can be removed from this browser without revoking independent share
   links. A separate Share links tab preserves source management handles; dirty
   removals warn, Undo is time-limited, and cross-tab removals preserve drafts.
