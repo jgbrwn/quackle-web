@@ -1295,6 +1295,9 @@ select:focus-visible {
 .import-file-button {
   width: 100%;
 }
+.import-open-link {
+  justify-self: start;
+}
 .import-progress {
   margin: 8px 0;
   color: #39705b;

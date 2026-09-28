@@ -3391,6 +3391,21 @@ function App() {
     }
   };
 
+  const openCrossTablesLink = () => {
+    try {
+      const link = parseCrossTablesUrl(crossTablesUrl);
+      window.open(link.url, "_blank", "noopener,noreferrer");
+      setImportError(null);
+      setStatus(`Opened Cross-Tables game ${link.gameId}`);
+    } catch (error) {
+      setImportError(
+        error instanceof Error
+          ? `Cross-Tables link rejected · ${error.message}`
+          : "Cross-Tables link rejected",
+      );
+    }
+  };
+
   const importCrossTables = async () => {
     let link: { url: string; gameId: number };
     try {
@@ -5291,6 +5306,16 @@ function App() {
                           {crossTablesBusy
                             ? "Fetching and validating…"
                             : "Fetch and review game"}
+                        </button>
+                        <button
+                          class="text-button import-open-link"
+                          type="button"
+                          onClick={openCrossTablesLink}
+                          disabled={
+                            crossTablesBusy || crossTablesUrl.trim() === ""
+                          }
+                        >
+                          Open source in Cross-Tables
                         </button>
                       </>
                     )}
