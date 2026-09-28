@@ -16,16 +16,23 @@ import {
   type GcgReplayFrame,
 } from "../../shared/gcg";
 import {
+  deleteScenario,
   getScenario,
   listScenarios,
+  listShareSources,
   loadActiveScenario,
   MAX_LOCAL_SCENARIOS,
   newScenarioId,
+  rememberShareSource,
+  restoreDeletedScenario,
   saveScenario,
   setActiveScenario,
+  subscribeToScenarioEvents,
   type ScenarioKind,
   type ScenarioRecord,
   type ScenarioSource,
+  type ShareSourceRecord,
+  type DeletedScenario,
 } from "./scenario-store";
 import "./styles.css";
 
@@ -34,6 +41,67 @@ const API_BASE_URL = (import.meta.env.VITE_QUACKLE_API_BASE_URL ?? "").replace(
   "",
 );
 const apiUrl = (path: string) => `${API_BASE_URL}${path}`;
+
+async function fetchShareCollection(
+  sourceSessionId: string,
+): Promise<{ links: ShareLink[]; notices: ShareLinkNotice[] }> {
+  const response = await fetch(
+    apiUrl(`/api/v1/sessions/${sourceSessionId}/share`),
+    { credentials: "include" },
+  );
+  if (!response.ok) throw new Error(`share_http_${response.status}`);
+  const data = (await response.json()) as {
+    shares?: unknown;
+    notices?: unknown;
+  };
+  const links = Array.isArray(data.shares)
+    ? data.shares.flatMap((value): ShareLink[] => {
+        if (
+          !isObject(value) ||
+          typeof value.shareId !== "string" ||
+          typeof value.sourceRevision !== "number" ||
+          typeof value.createdAt !== "string" ||
+          (value.expiresAt !== null && typeof value.expiresAt !== "string") ||
+          typeof value.useCount !== "number" ||
+          (value.lastUsedAt !== null && typeof value.lastUsedAt !== "string")
+        )
+          return [];
+        return [
+          {
+            shareId: value.shareId,
+            sourceRevision: value.sourceRevision,
+            createdAt: value.createdAt,
+            expiresAt: value.expiresAt,
+            useCount: value.useCount,
+            lastUsedAt: value.lastUsedAt,
+          },
+        ];
+      })
+    : [];
+  const notices = Array.isArray(data.notices)
+    ? data.notices.flatMap((value): ShareLinkNotice[] => {
+        if (
+          !isObject(value) ||
+          typeof value.shareId !== "string" ||
+          typeof value.sourceRevision !== "number" ||
+          typeof value.createdAt !== "string" ||
+          typeof value.evictedAt !== "string" ||
+          (value.reason !== "active_limit" && value.reason !== "storage_limit")
+        )
+          return [];
+        return [
+          {
+            shareId: value.shareId,
+            sourceRevision: value.sourceRevision,
+            createdAt: value.createdAt,
+            evictedAt: value.evictedAt,
+            reason: value.reason,
+          },
+        ];
+      })
+    : [];
+  return { links, notices };
+}
 
 type Cell = { letter: string; blank?: boolean };
 type Move = {
@@ -63,6 +131,12 @@ type SessionResponse = {
   };
 };
 
+type SessionPersistResult = {
+  revision: number;
+  draftVersion: number;
+  draftChangedDuringSave: boolean;
+};
+
 type ShareLink = {
   shareId: string;
   sourceRevision: number;
@@ -78,6 +152,19 @@ type ShareLinkNotice = {
   createdAt: string;
   evictedAt: string;
   reason: "active_limit" | "storage_limit";
+};
+
+type ShareSourceView = {
+  status: "unchecked" | "checking" | "ready" | "offline" | "unavailable";
+  links: ShareLink[];
+  notices: ShareLinkNotice[];
+  checkedAt?: string;
+};
+
+type PendingShareRevoke = {
+  sourceSessionId: string;
+  shareId: string;
+  title: string;
 };
 
 type AnalysisJobResponse = {
@@ -848,9 +935,17 @@ async function apiErrorMessage(
 }
 
 function App() {
-  const [draftState, setDraftState] = useState<SessionStateDraft>(
+  const [draftState, setDraftStateState] = useState<SessionStateDraft>(
     DEFAULT_SESSION_STATE,
   );
+  const draftWriteVersionRef = useRef(0);
+  const setDraftState = (
+    next:
+      SessionStateDraft | ((previous: SessionStateDraft) => SessionStateDraft),
+  ) => {
+    draftWriteVersionRef.current += 1;
+    setDraftStateState(next);
+  };
   const [selectedRackIndex, setSelectedRackIndex] = useState<number | null>(
     null,
   );
@@ -882,10 +977,22 @@ function App() {
   const [activeLocalId, setActiveLocalId] = useState<string | null>(null);
   const [scenarioDirty, setScenarioDirty] = useState(false);
   const [scenariosOpen, setScenariosOpen] = useState(false);
+  const [scenarioTab, setScenarioTab] = useState<"scenarios" | "shares">(
+    "scenarios",
+  );
   const [scenarioBusy, setScenarioBusy] = useState(false);
+  const [scenarioRemovalCandidate, setScenarioRemovalCandidate] =
+    useState<ScenarioRecord | null>(null);
+  const [scenarioRemovalBusy, setScenarioRemovalBusy] = useState(false);
+  const [undoScenarioDeletion, setUndoScenarioDeletion] =
+    useState<DeletedScenario | null>(null);
+  const [orphanedScenarioTitle, setOrphanedScenarioTitle] = useState<
+    string | null
+  >(null);
   const [boardWarnings, setBoardWarnings] = useState<string[]>([]);
   const pendingOpenStatusRef = useRef<string | null>(null);
   const draftStateRef = useRef<SessionStateDraft | null>(null);
+  const scenarioListRef = useRef<ScenarioRecord[]>([]);
   const [entryMode, setEntryMode] = useState<"tap" | "type">("tap");
   const [rackEditMode, setRackEditMode] = useState(false);
   const [boardDirection, setBoardDirection] = useState<
@@ -925,20 +1032,58 @@ function App() {
   const suppressRackClickRef = useRef(false);
   const [crossTablesUrl, setCrossTablesUrl] = useState("");
   const [crossTablesBusy, setCrossTablesBusy] = useState(false);
-  const [shareLinks, setShareLinks] = useState<ShareLink[]>([]);
-  const [shareNotices, setShareNotices] = useState<ShareLinkNotice[]>([]);
-  const [shareLinksLoading, setShareLinksLoading] = useState(false);
-  const [shareLinkAction, setShareLinkAction] = useState<string | null>(null);
-  const [shareNoticeAction, setShareNoticeAction] = useState<string | null>(
+  const [shareSources, setShareSources] = useState<ShareSourceRecord[]>([]);
+  const [shareSourceViews, setShareSourceViews] = useState<
+    Record<string, ShareSourceView>
+  >({});
+  const [shareSourcesLoading, setShareSourcesLoading] = useState(false);
+  const [shareSourcesRefreshing, setShareSourcesRefreshing] = useState(false);
+  const [shareSourceAction, setShareSourceAction] = useState<string | null>(
     null,
   );
+  const [pendingShareRevoke, setPendingShareRevoke] =
+    useState<PendingShareRevoke | null>(null);
+
+  const [shareCreationUrl, setShareCreationUrl] = useState<string | null>(null);
   const activeJobIdRef = useRef<string | null>(null);
   const analysisAbortRef = useRef<AbortController | null>(null);
   const analysisCancelledRef = useRef(false);
+  const undoScenarioTimerRef = useRef<number | null>(null);
+  const activeLocalIdRef = useRef<string | null>(null);
+  const activeScenarioGenerationRef = useRef(0);
+  const sessionIdRef = useRef<string | null>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
   const importGcgInputRef = useRef<HTMLInputElement>(null);
 
   draftStateRef.current = draftState;
+  activeLocalIdRef.current = activeLocalId;
+  sessionIdRef.current = sessionId;
+  scenarioListRef.current = scenarioList;
+  const preserveActiveDraftAsOrphan = (localId: string, title: string) => {
+    if (activeLocalIdRef.current !== localId) return;
+    activeLocalIdRef.current = null;
+    setActiveLocalId(null);
+    setOrphanedScenarioTitle(title);
+    setScenarioDirty(true);
+    setStatus(
+      "This scenario changed or was removed elsewhere · keep a copy to save it",
+    );
+  };
+  const adoptScenarioFromAnotherTab = (
+    scenario: ScenarioRecord,
+    status = "Scenario refreshed from another tab",
+  ) => {
+    activeScenarioGenerationRef.current = scenario.localGeneration ?? 0;
+    setDraftState(draftStateFromUnknown(scenario.state));
+    setSessionId(scenario.sessionId);
+    setRevision(scenario.revision);
+    setScenarioDirty(scenario.dirty);
+    pendingOpenStatusRef.current = status;
+    setSessionReady(false);
+    setConnectionState("connecting");
+    setSessionAttempt((attempt) => attempt + 1);
+    setStatus(status);
+  };
   const cells = useMemo(() => cellsFromState(draftState), [draftState]);
   const rack = draftState.position.rack;
   const selectedTile =
@@ -1056,6 +1201,7 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
+    const pinnedActiveId = activeLocalIdRef.current;
     setConnectionState("connecting");
     setSessionReady(false);
     setStatus(
@@ -1065,6 +1211,14 @@ function App() {
       let scenario: ScenarioRecord | null = null;
       const share = readShareFragment();
       if (share) {
+        // A share token is a bearer capability. Remove it from the address
+        // bar/history before the request so failures or reloads cannot
+        // accidentally redeem it again.
+        window.history.replaceState(
+          null,
+          "",
+          `${window.location.pathname}${window.location.search}`,
+        );
         try {
           const response = await fetch(apiUrl("/api/v1/shares/redeem"), {
             method: "POST",
@@ -1101,16 +1255,38 @@ function App() {
                 : {}),
             },
           };
-          await saveScenario(scenario).catch(() => undefined);
+          if (!(await saveScenario(scenario).catch(() => false))) {
+            throw new Error("scenario_removed");
+          }
           await setActiveScenario(scenario.localId).catch(() => undefined);
-          window.history.replaceState(
-            null,
-            "",
-            `${window.location.pathname}${window.location.search}`,
-          );
         } catch {
           setStatus("Share link unavailable · opening the last local scenario");
         }
+      }
+      if (!scenario && pinnedActiveId) {
+        scenario = await getScenario(pinnedActiveId).catch(() => null);
+        if (!scenario) {
+          const title =
+            scenarioListRef.current.find(
+              (item) => item.localId === pinnedActiveId,
+            )?.title ?? "Removed scenario";
+          activeLocalIdRef.current = null;
+          setActiveLocalId(null);
+          setOrphanedScenarioTitle(title);
+          setScenarioDirty(true);
+          setConnectionState("offline");
+          setStatus(
+            "This scenario is no longer saved in this browser · save a copy to reconnect",
+          );
+          return;
+        }
+      }
+      if (!scenario && !pinnedActiveId && orphanedScenarioTitle) {
+        setConnectionState("offline");
+        setStatus(
+          "This scenario was removed from this browser · save a copy to reconnect",
+        );
+        return;
       }
       if (!scenario) scenario = await loadActiveScenario().catch(() => null);
       if (scenario && isLegacyFixtureScenario(scenario)) {
@@ -1125,7 +1301,7 @@ function App() {
           savedAt: timestamp,
           lastOpenedAt: timestamp,
         };
-        await saveScenario(scenario).catch(() => undefined);
+        await saveScenario(scenario).catch(() => false);
       }
       if (!scenario) {
         const timestamp = new Date().toISOString();
@@ -1143,11 +1319,13 @@ function App() {
           lastOpenedAt: timestamp,
           source: { kind: "new" },
         };
-        await saveScenario(scenario).catch(() => undefined);
+        await saveScenario(scenario).catch(() => false);
       }
       if (cancelled) return;
 
       const localState = draftStateFromUnknown(scenario.state);
+      activeLocalIdRef.current = scenario.localId;
+      activeScenarioGenerationRef.current = scenario.localGeneration ?? 0;
       setActiveLocalId(scenario.localId);
       setDraftState(localState);
       setSessionId(scenario.sessionId);
@@ -1176,6 +1354,7 @@ function App() {
             credentials: "include",
           });
         }
+        if (cancelled || activeLocalIdRef.current !== scenario.localId) return;
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         let data = (await response.json()) as SessionResponse;
         let restoredState = localState;
@@ -1197,6 +1376,8 @@ function App() {
               }),
             },
           );
+          if (cancelled || activeLocalIdRef.current !== scenario.localId)
+            return;
           if (!update.ok) throw new Error(`HTTP ${update.status}`);
           data = (await update.json()) as SessionResponse;
           nextRevision = data.session.revision;
@@ -1211,9 +1392,10 @@ function App() {
           setStatus("Session changed · local copy preserved");
         }
 
-        if (cancelled) return;
+        if (cancelled || activeLocalIdRef.current !== scenario.localId) return;
         // Do not clobber edits the user made while the session was connecting.
-        const editedWhileConnecting = draftStateRef.current !== localState;
+        const currentDraft = draftStateRef.current ?? localState;
+        const editedWhileConnecting = currentDraft !== localState;
         if (!editedWhileConnecting) setDraftState(restoredState);
         setSessionId(data.session.id);
         setRevision(nextRevision);
@@ -1237,22 +1419,53 @@ function App() {
         const updatedScenario: ScenarioRecord = {
           ...scenario,
           sessionId: data.session.id,
-          state: nextState,
+          state: editedWhileConnecting ? currentDraft : nextState,
           revision: nextRevision,
-          dirty: nextDirty,
+          dirty: editedWhileConnecting || nextDirty,
           savedAt: new Date().toISOString(),
           lastOpenedAt: new Date().toISOString(),
         };
-        await saveScenario(updatedScenario).catch(() => undefined);
+        const saved = await saveScenario(updatedScenario, false).catch(
+          () => false,
+        );
+        if (!saved) {
+          const latest = await getScenario(scenario.localId).catch(() => null);
+          if (cancelled || activeLocalIdRef.current !== scenario.localId)
+            return;
+          if (!latest) {
+            preserveActiveDraftAsOrphan(scenario.localId, scenario.title);
+            return;
+          }
+          if (
+            (latest.localGeneration ?? 0) !==
+            activeScenarioGenerationRef.current
+          ) {
+            if (editedWhileConnecting) {
+              preserveActiveDraftAsOrphan(scenario.localId, latest.title);
+            } else {
+              adoptScenarioFromAnotherTab(latest);
+            }
+            return;
+          }
+          setScenarioDirty(true);
+          setStatus(
+            "Local draft could not be saved · export JSON before leaving",
+          );
+          return;
+        }
         setScenarioList(await listScenarios().catch(() => [updatedScenario]));
       } catch (error) {
-        if (cancelled) return;
+        if (cancelled || activeLocalIdRef.current !== scenario.localId) return;
         pendingOpenStatusRef.current = null;
         setSessionReady(false);
         setConnectionState("offline");
-        setDraftState(localState);
+        const currentDraft = draftStateRef.current;
+        const editedWhileConnecting =
+          currentDraft !== null && currentDraft !== localState;
+        if (!editedWhileConnecting) setDraftState(localState);
         setSessionId(scenario.sessionId);
         setRevision(scenario.revision);
+        setScenarioDirty(editedWhileConnecting || scenario.dirty);
         if (error instanceof Error && error.message === "session_unavailable") {
           setStatus("Session unavailable · local copy preserved");
         } else if (scenario.sessionId) {
@@ -1289,22 +1502,132 @@ function App() {
     };
   }, [analyzing, sessionReady]);
 
+  useEffect(
+    () =>
+      subscribeToScenarioEvents((event) => {
+        void Promise.all([listScenarios(), listShareSources()])
+          .then(([scenarios, sources]) => {
+            setScenarioList(scenarios);
+            setShareSources(sources);
+          })
+          .catch(() => undefined);
+        if (event.type === "sources-changed") {
+          setShareSourceViews((previous) => ({
+            ...previous,
+            [event.sessionId]: {
+              ...previous[event.sessionId],
+              status: "unchecked",
+            },
+          }));
+          return;
+        }
+        if (event.type !== "removed") return;
+        const removedActiveId = activeLocalIdRef.current;
+        if (!removedActiveId || !event.localIds.includes(removedActiveId))
+          return;
+        const title =
+          scenarioListRef.current.find(
+            (scenario) => scenario.localId === removedActiveId,
+          )?.title ?? "Removed scenario";
+        preserveActiveDraftAsOrphan(removedActiveId, title);
+      }),
+    [],
+  );
+
+  useEffect(
+    () => () => {
+      if (undoScenarioTimerRef.current !== null)
+        window.clearTimeout(undoScenarioTimerRef.current);
+    },
+    [],
+  );
+
   useEffect(() => {
     if (!hydrated || !activeLocalId) return;
-    void getScenario(activeLocalId)
-      .then((existing) => {
-        if (!existing) return;
-        return saveScenario({
-          ...existing,
-          sessionId,
-          revision,
-          state: draftState,
-          dirty: scenarioDirty,
-          savedAt: new Date().toISOString(),
-          lastOpenedAt: new Date().toISOString(),
-        }).then(() => listScenarios().then(setScenarioList));
+    const scenarioId = activeLocalId;
+    const draftSnapshot = draftState;
+    const sessionSnapshot = sessionId;
+    const revisionSnapshot = revision;
+    const dirtySnapshot = scenarioDirty;
+    let cancelled = false;
+    void getScenario(scenarioId)
+      .then(async (existing) => {
+        if (
+          cancelled ||
+          activeLocalIdRef.current !== scenarioId ||
+          sessionIdRef.current !== sessionSnapshot ||
+          draftStateRef.current !== draftSnapshot
+        )
+          return;
+        if (!existing) {
+          preserveActiveDraftAsOrphan(
+            scenarioId,
+            scenarioListRef.current.find((item) => item.localId === scenarioId)
+              ?.title ?? "Removed scenario",
+          );
+          return;
+        }
+        if (
+          (existing.localGeneration ?? 0) !==
+          activeScenarioGenerationRef.current
+        ) {
+          if (dirtySnapshot)
+            preserveActiveDraftAsOrphan(scenarioId, existing.title);
+          else adoptScenarioFromAnotherTab(existing);
+          return;
+        }
+        const saved = await saveScenario(
+          {
+            ...existing,
+            // Keep the generation observed when this scenario was activated.
+            // Re-reading a newer generation here could let an old tab overwrite
+            // a remove/Undo performed elsewhere.
+            localGeneration: activeScenarioGenerationRef.current,
+            sessionId: sessionSnapshot,
+            revision: revisionSnapshot,
+            state: draftSnapshot,
+            dirty: dirtySnapshot,
+            savedAt: new Date().toISOString(),
+            lastOpenedAt: new Date().toISOString(),
+          },
+          false,
+        );
+        if (!saved) {
+          const latest = await getScenario(scenarioId).catch(() => null);
+          if (cancelled || activeLocalIdRef.current !== scenarioId) return;
+          if (
+            !latest ||
+            (latest.localGeneration ?? 0) !==
+              activeScenarioGenerationRef.current
+          ) {
+            if (dirtySnapshot)
+              preserveActiveDraftAsOrphan(
+                scenarioId,
+                latest?.title ?? existing.title,
+              );
+            else if (latest) adoptScenarioFromAnotherTab(latest);
+            else preserveActiveDraftAsOrphan(scenarioId, existing.title);
+            return;
+          }
+          setScenarioDirty(true);
+          setStatus(
+            "Local draft could not be saved · export JSON before leaving",
+          );
+          return;
+        }
+        setScenarioList(await listScenarios().catch(() => []));
       })
-      .catch(() => undefined);
+      .catch(() => {
+        if (!cancelled && activeLocalIdRef.current === scenarioId) {
+          setScenarioDirty(true);
+          setStatus(
+            "Local draft could not be saved · export JSON before leaving",
+          );
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [activeLocalId, draftState, hydrated, revision, scenarioDirty, sessionId]);
 
   const moveReplayCursor = (index: number | null, message?: string) => {
@@ -1729,25 +2052,61 @@ function App() {
     boardDirection,
   ]);
 
-  const persistSession = async (): Promise<number | null> => {
+  const persistSession = async (): Promise<SessionPersistResult | null> => {
     if (!sessionId) return null;
-    const response = await fetch(apiUrl(`/api/v1/sessions/${sessionId}`), {
-      method: "PUT",
-      credentials: "include",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ expectedRevision: revision, state: draftState }),
-    });
+    const requestSessionId = sessionId;
+    const requestLocalId = activeLocalIdRef.current;
+    const requestRevision = revision;
+    const requestState = draftState;
+    const requestDraftVersion = draftWriteVersionRef.current;
+    let response: Response;
+    try {
+      response = await fetch(apiUrl(`/api/v1/sessions/${requestSessionId}`), {
+        method: "PUT",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          expectedRevision: requestRevision,
+          state: requestState,
+        }),
+      });
+    } catch (error) {
+      if (
+        activeLocalIdRef.current !== requestLocalId ||
+        sessionIdRef.current !== requestSessionId
+      )
+        return null;
+      throw error;
+    }
+    // A scenario can be switched/removed while this network request is in
+    // flight. Its response belongs only to the scenario/session that issued it.
+    if (
+      activeLocalIdRef.current !== requestLocalId ||
+      sessionIdRef.current !== requestSessionId
+    )
+      return null;
     if (response.status === 409) {
       setStatus("Session changed in another tab");
       return null;
     }
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = (await response.json()) as SessionResponse;
+    if (
+      activeLocalIdRef.current !== requestLocalId ||
+      sessionIdRef.current !== requestSessionId
+    )
+      return null;
+    const draftChangedDuringSave =
+      draftWriteVersionRef.current !== requestDraftVersion;
     setRevision(data.session.revision);
     setSessionReady(true);
     setConnectionState("online");
-    setScenarioDirty(false);
-    return data.session.revision;
+    setScenarioDirty(draftChangedDuringSave);
+    return {
+      revision: data.session.revision,
+      draftVersion: requestDraftVersion,
+      draftChangedDuringSave,
+    };
   };
 
   const reconnectSession = () => {
@@ -1775,32 +2134,223 @@ function App() {
     setAnalyzing(false);
   };
 
-  const activateScenario = async (scenario: ScenarioRecord) => {
+  const activateScenario = async (
+    scenario: ScenarioRecord,
+    closeScenarios = true,
+    allowOrphanedDraft = false,
+  ): Promise<boolean> => {
+    const previousActiveId = activeLocalIdRef.current;
+    if (!previousActiveId && orphanedScenarioTitle && !allowOrphanedDraft) {
+      setStatus("Save a copy of the removed draft before switching scenarios");
+      return false;
+    }
+    if (previousActiveId === scenario.localId) {
+      const latest = await getScenario(previousActiveId).catch(() => null);
+      if (!latest) {
+        stopAnalysisForScenarioSwitch();
+        const title =
+          scenarioListRef.current.find(
+            (item) => item.localId === previousActiveId,
+          )?.title ?? scenario.title;
+        preserveActiveDraftAsOrphan(previousActiveId, title);
+        return false;
+      }
+      if ((latest.localGeneration ?? 0) > activeScenarioGenerationRef.current) {
+        stopAnalysisForScenarioSwitch();
+        if (scenarioDirty) {
+          preserveActiveDraftAsOrphan(previousActiveId, latest.title);
+          return false;
+        }
+        adoptScenarioFromAnotherTab(latest);
+      }
+      if (closeScenarios) setScenariosOpen(false);
+      return true;
+    }
+    const outgoingDraft = draftStateRef.current ?? draftState;
+    const outgoingSessionId = sessionId;
+    const outgoingRevision = revision;
+    const outgoingDirty = scenarioDirty;
     stopAnalysisForScenarioSwitch();
     setScenarioBusy(true);
+    setSessionReady(false);
+    setConnectionState("connecting");
     setStatus(`Opening ${scenario.title}…`);
+    let outgoingCanRestore = false;
+    let outgoingRestoreDraft = outgoingDraft;
+    let outgoingRestoreSessionId = outgoingSessionId;
+    let outgoingRestoreRevision = outgoingRevision;
+    let outgoingRestoreDirty = outgoingDirty;
     try {
-      const opened: ScenarioRecord = {
+      if (previousActiveId) {
+        // Detach first so queued autosaves stop starting. Advance the local
+        // generation on the outgoing snapshot to fence writes already queued.
+        activeLocalIdRef.current = null;
+        setActiveLocalId(null);
+        const previous = await getScenario(previousActiveId);
+        if (!previous) {
+          if (outgoingDirty) {
+            setOrphanedScenarioTitle(
+              scenarioListRef.current.find(
+                (item) => item.localId === previousActiveId,
+              )?.title ?? "Removed scenario",
+            );
+            setScenarioDirty(true);
+            setStatus(
+              "Previous scenario was removed elsewhere · save a copy before switching",
+            );
+            return false;
+          }
+        } else if (
+          (previous.localGeneration ?? 0) !==
+          activeScenarioGenerationRef.current
+        ) {
+          if (outgoingDirty) {
+            setOrphanedScenarioTitle(previous.title);
+            setScenarioDirty(true);
+            setStatus(
+              "Scenario changed in another tab · save a copy before switching",
+            );
+            return false;
+          }
+          // A clean editor yields to the newer persisted version without
+          // writing this tab's older generation over another tab's changes.
+          outgoingRestoreDraft = draftStateFromUnknown(previous.state);
+          outgoingRestoreSessionId = previous.sessionId;
+          outgoingRestoreRevision = previous.revision;
+          outgoingRestoreDirty = previous.dirty;
+          outgoingCanRestore = true;
+        } else {
+          const saved = await saveScenario(
+            {
+              ...previous,
+              sessionId: outgoingSessionId ?? previous.sessionId,
+              revision: outgoingRevision,
+              state: outgoingDraft,
+              dirty: outgoingDirty,
+              savedAt: new Date().toISOString(),
+              lastOpenedAt: new Date().toISOString(),
+            },
+            false,
+            true,
+          );
+          if (!saved) {
+            const latest = await getScenario(previousActiveId);
+            if (outgoingDirty) {
+              setOrphanedScenarioTitle(previous.title);
+              setScenarioDirty(true);
+              setStatus(
+                "Scenario changed in another tab · save a copy before switching",
+              );
+              return false;
+            }
+            if (latest) {
+              outgoingRestoreDraft = draftStateFromUnknown(latest.state);
+              outgoingRestoreSessionId = latest.sessionId;
+              outgoingRestoreRevision = latest.revision;
+              outgoingRestoreDirty = latest.dirty;
+              outgoingCanRestore = true;
+            }
+          } else {
+            outgoingCanRestore = true;
+          }
+        }
+      }
+
+      const requested: ScenarioRecord = {
         ...scenario,
         lastOpenedAt: new Date().toISOString(),
         savedAt: new Date().toISOString(),
       };
-      await saveScenario(opened);
-      await setActiveScenario(opened.localId);
-      setActiveLocalId(opened.localId);
-      setDraftState(draftStateFromUnknown(opened.state));
-      setSessionId(opened.sessionId);
-      setRevision(opened.revision);
-      setScenarioDirty(opened.dirty);
+      const latest = await getScenario(requested.localId);
+      if (!latest && requested.sessionId !== null)
+        throw new Error("scenario_removed");
+      const activation = latest
+        ? {
+            ...latest,
+            lastOpenedAt: requested.lastOpenedAt,
+            savedAt: requested.savedAt,
+          }
+        : requested;
+      if (!(await saveScenario(activation, false)))
+        throw new Error("scenario_removed");
+      await setActiveScenario(requested.localId);
+      activeLocalIdRef.current = requested.localId;
+      activeScenarioGenerationRef.current = activation.localGeneration ?? 0;
+      setOrphanedScenarioTitle(null);
+      setActiveLocalId(requested.localId);
+      setDraftState(draftStateFromUnknown(activation.state));
+      setSessionId(activation.sessionId);
+      setRevision(activation.revision);
+      setScenarioDirty(activation.dirty);
       setSelectedRackIndex(null);
       setSelectedPaletteTile(null);
       setSelectedMoveIndex(null);
       setBlankPickerIndex(null);
       setMoves([]);
       setRetryAvailable(false);
-      setScenariosOpen(false);
+      if (closeScenarios) setScenariosOpen(false);
       setSessionAttempt((attempt) => attempt + 1);
       setScenarioList(await listScenarios());
+      return true;
+    } catch (error) {
+      if (previousActiveId) {
+        const previous = await getScenario(previousActiveId).catch(() => null);
+        if (previous && (outgoingCanRestore || !outgoingDirty)) {
+          let restoredActive = false;
+          try {
+            await setActiveScenario(previous.localId);
+            restoredActive = true;
+          } catch {
+            restoredActive = false;
+          }
+          if (restoredActive) {
+            activeLocalIdRef.current = previous.localId;
+            activeScenarioGenerationRef.current = previous.localGeneration ?? 0;
+            setActiveLocalId(previous.localId);
+            setDraftState(
+              outgoingCanRestore
+                ? outgoingRestoreDraft
+                : draftStateFromUnknown(previous.state),
+            );
+            setSessionId(
+              outgoingCanRestore
+                ? outgoingRestoreSessionId
+                : previous.sessionId,
+            );
+            setRevision(
+              outgoingCanRestore ? outgoingRestoreRevision : previous.revision,
+            );
+            setScenarioDirty(
+              outgoingCanRestore ? outgoingRestoreDirty : previous.dirty,
+            );
+            setConnectionState("connecting");
+            setSessionReady(false);
+            setSessionAttempt((attempt) => attempt + 1);
+          }
+        } else if (outgoingDirty) {
+          const title =
+            scenarioListRef.current.find(
+              (item) => item.localId === previousActiveId,
+            )?.title ?? "Removed scenario";
+          activeLocalIdRef.current = null;
+          setActiveLocalId(null);
+          setOrphanedScenarioTitle(title);
+          setDraftState(outgoingDraft);
+          setSessionId(outgoingSessionId);
+          setRevision(outgoingRevision);
+          setScenarioDirty(true);
+        } else {
+          activeLocalIdRef.current = null;
+          setActiveLocalId(null);
+        }
+      }
+      setScenarioList(await listScenarios().catch(() => []));
+      setStatus(
+        error instanceof Error && error.message.includes("removed")
+          ? "Scenario was removed in another tab · choose another"
+          : "Scenario could not be opened · retry",
+      );
+      return false;
     } finally {
       setScenarioBusy(false);
     }
@@ -1811,26 +2361,32 @@ function App() {
     title: string,
     state: SessionStateDraft,
     source: ScenarioSource,
-  ) => {
+    keepScenarioDrawerOpen = false,
+    allowOrphanedDraft = false,
+  ): Promise<boolean> => {
     const timestamp = new Date().toISOString();
-    await activateScenario({
-      schemaVersion: 1,
-      localId: newScenarioId(),
-      sessionId: null,
-      kind,
-      title,
-      state,
-      revision: 0,
-      dirty:
-        kind === "imported" ||
-        kind === "forked" ||
-        state.position.rack.length > 0 ||
-        state.position.board.cells.length > 0,
-      createdAt: timestamp,
-      savedAt: timestamp,
-      lastOpenedAt: timestamp,
-      source,
-    });
+    return activateScenario(
+      {
+        schemaVersion: 1,
+        localId: newScenarioId(),
+        sessionId: null,
+        kind,
+        title,
+        state,
+        revision: 0,
+        dirty:
+          kind === "imported" ||
+          kind === "forked" ||
+          state.position.rack.length > 0 ||
+          state.position.board.cells.length > 0,
+        createdAt: timestamp,
+        savedAt: timestamp,
+        lastOpenedAt: timestamp,
+        source,
+      },
+      !keepScenarioDrawerOpen,
+      allowOrphanedDraft,
+    );
   };
 
   const createNewGame = () =>
@@ -1848,74 +2404,249 @@ function App() {
       { kind: "new" },
     );
 
-  const loadShareLinks = async () => {
-    if (!sessionId || !sessionReady) return;
-    setShareLinksLoading(true);
+  const saveOrphanedScenarioCopy = () => {
+    if (!orphanedScenarioTitle) return;
+    void createScenario(
+      "new",
+      `${orphanedScenarioTitle.slice(0, 48)} · recovered copy`,
+      draftState,
+      { kind: "new" },
+      true,
+      true,
+    );
+  };
+
+  const removeScenarioFromBrowser = async () => {
+    const requested = scenarioRemovalCandidate;
+    if (!requested) return;
+    setScenarioRemovalBusy(true);
+    let detachedActive = false;
+    let deletion: DeletedScenario | null = null;
     try {
-      const response = await fetch(
-        apiUrl(`/api/v1/sessions/${sessionId}/share`),
-        { credentials: "include" },
+      const latest = await getScenario(requested.localId);
+      if (!latest) {
+        setScenarioList(await listScenarios().catch(() => []));
+        if (activeLocalIdRef.current === requested.localId) {
+          preserveActiveDraftAsOrphan(requested.localId, requested.title);
+        }
+        setStatus("Scenario was already removed · list refreshed");
+        setScenarioRemovalCandidate(null);
+        return;
+      }
+      const isActive = activeLocalIdRef.current === latest.localId;
+      if (isActive) {
+        if (
+          (latest.localGeneration ?? 0) !== activeScenarioGenerationRef.current
+        ) {
+          setScenarioRemovalCandidate(null);
+          if (scenarioDirty) {
+            preserveActiveDraftAsOrphan(latest.localId, latest.title);
+          } else {
+            adoptScenarioFromAnotherTab(
+              latest,
+              "Scenario changed in another tab · refreshed; review it before removing",
+            );
+          }
+          return;
+        }
+        // Stop starting autosaves for this ID before capturing its latest
+        // editor state. Bumping the local generation makes already-queued
+        // older writes fail their IndexedDB compare-and-save check.
+        stopAnalysisForScenarioSwitch();
+        activeLocalIdRef.current = null;
+        setActiveLocalId(null);
+        detachedActive = true;
+        const saved = await saveScenario(
+          {
+            ...latest,
+            sessionId,
+            revision,
+            state: draftState,
+            dirty: scenarioDirty,
+            savedAt: new Date().toISOString(),
+            lastOpenedAt: new Date().toISOString(),
+          },
+          false,
+          true,
+        );
+        if (!saved) throw new Error("scenario_removed");
+        const currentList = await listScenarios();
+        const fallback = currentList.find(
+          (scenario) => scenario.localId !== latest.localId,
+        );
+        const switched = fallback
+          ? await activateScenario(fallback, false)
+          : await createScenario(
+              "new",
+              `New game · ${formatScenarioTime()}`,
+              freshPositionState(randomOpeningRack()),
+              { kind: "new" },
+              true,
+            );
+        if (!switched) {
+          const recovery = await getScenario(latest.localId);
+          if (recovery) await activateScenario(recovery, false);
+          throw new Error("fallback_unavailable");
+        }
+        setScenariosOpen(true);
+        setScenarioTab("scenarios");
+      }
+
+      deletion = await deleteScenario(latest.localId);
+      const completedDeletion = deletion;
+      if (!completedDeletion) throw new Error("scenario_removed");
+      setScenarioList(await listScenarios().catch(() => []));
+      setScenarioRemovalCandidate(null);
+      setUndoScenarioDeletion(completedDeletion);
+      if (undoScenarioTimerRef.current !== null)
+        window.clearTimeout(undoScenarioTimerRef.current);
+      undoScenarioTimerRef.current = window.setTimeout(() => {
+        setUndoScenarioDeletion((current) =>
+          current?.deletionId === completedDeletion.deletionId ? null : current,
+        );
+        undoScenarioTimerRef.current = null;
+      }, 10_000);
+      setStatus(
+        `Removed “${latest.title}” from this browser · share links are unchanged`,
       );
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = (await response.json()) as {
-        shares?: unknown;
-        notices?: unknown;
-      };
-      const links = Array.isArray(data.shares)
-        ? data.shares.flatMap((value): ShareLink[] => {
-            if (
-              !isObject(value) ||
-              typeof value.shareId !== "string" ||
-              typeof value.sourceRevision !== "number" ||
-              typeof value.createdAt !== "string" ||
-              (value.expiresAt !== null &&
-                typeof value.expiresAt !== "string") ||
-              typeof value.useCount !== "number" ||
-              (value.lastUsedAt !== null &&
-                typeof value.lastUsedAt !== "string")
-            )
-              return [];
-            return [
-              {
-                shareId: value.shareId,
-                sourceRevision: value.sourceRevision,
-                createdAt: value.createdAt,
-                expiresAt: value.expiresAt,
-                useCount: value.useCount,
-                lastUsedAt: value.lastUsedAt,
-              },
-            ];
-          })
-        : [];
-      const notices = Array.isArray(data.notices)
-        ? data.notices.flatMap((value): ShareLinkNotice[] => {
-            if (
-              !isObject(value) ||
-              typeof value.shareId !== "string" ||
-              typeof value.sourceRevision !== "number" ||
-              typeof value.createdAt !== "string" ||
-              typeof value.evictedAt !== "string" ||
-              (value.reason !== "active_limit" &&
-                value.reason !== "storage_limit")
-            )
-              return [];
-            return [
-              {
-                shareId: value.shareId,
-                sourceRevision: value.sourceRevision,
-                createdAt: value.createdAt,
-                evictedAt: value.evictedAt,
-                reason: value.reason,
-              },
-            ];
-          })
-        : [];
-      setShareLinks(links);
-      setShareNotices(notices);
-    } catch {
-      setStatus("Shared links unavailable · retry");
+    } catch (error) {
+      if (detachedActive && !deletion) {
+        const recovery = await getScenario(requested.localId).catch(() => null);
+        if (recovery) await activateScenario(recovery, false);
+      }
+      setStatus(
+        error instanceof Error && error.message === "fallback_unavailable"
+          ? "Could not switch scenarios · removal cancelled"
+          : "Scenario could not be removed · refresh and retry",
+      );
     } finally {
-      setShareLinksLoading(false);
+      setScenarioRemovalBusy(false);
+    }
+  };
+
+  const undoScenarioRemoval = async () => {
+    const deletion = undoScenarioDeletion;
+    if (!deletion) return;
+    setScenarioRemovalBusy(true);
+    try {
+      const restored = await restoreDeletedScenario(deletion);
+      if (!restored) {
+        setStatus(
+          "Undo expired or scenario changed · the current scenario was not overwritten",
+        );
+        setUndoScenarioDeletion(null);
+        return;
+      }
+      if (undoScenarioTimerRef.current !== null)
+        window.clearTimeout(undoScenarioTimerRef.current);
+      undoScenarioTimerRef.current = null;
+      setUndoScenarioDeletion(null);
+      setScenarioList(await listScenarios());
+      setStatus(
+        `Restored “${restored.title}” to this browser · it was not opened`,
+      );
+    } catch {
+      setStatus("Scenario could not be restored · refresh and retry");
+    } finally {
+      setScenarioRemovalBusy(false);
+    }
+  };
+
+  const loadShareSources = async () => {
+    setShareSourcesLoading(true);
+    try {
+      const sources = await listShareSources();
+      setShareSources(sources);
+      setShareSourceViews((previous) =>
+        Object.fromEntries(
+          sources.map((source) => [
+            source.sessionId,
+            previous[source.sessionId] ?? {
+              status: "unchecked",
+              links: [],
+              notices: [],
+            },
+          ]),
+        ),
+      );
+    } catch {
+      setStatus("Share sources unavailable · retry");
+    } finally {
+      setShareSourcesLoading(false);
+    }
+  };
+
+  const checkShareSource = async (source: ShareSourceRecord) => {
+    setShareSourceViews((previous) => ({
+      ...previous,
+      [source.sessionId]: {
+        ...previous[source.sessionId],
+        status: "checking",
+        links: previous[source.sessionId]?.links ?? [],
+        notices: previous[source.sessionId]?.notices ?? [],
+      },
+    }));
+    try {
+      const collection = await fetchShareCollection(source.sessionId);
+      setShareSourceViews((previous) => ({
+        ...previous,
+        [source.sessionId]: {
+          status: "ready",
+          checkedAt: new Date().toISOString(),
+          ...collection,
+        },
+      }));
+    } catch (error) {
+      const status =
+        !navigator.onLine || error instanceof TypeError
+          ? "offline"
+          : "unavailable";
+      setShareSourceViews((previous) => ({
+        ...previous,
+        [source.sessionId]: { ...previous[source.sessionId], status },
+      }));
+    }
+  };
+
+  const refreshAllShareSources = async (force = true) => {
+    setShareSourcesRefreshing(true);
+    try {
+      const sources = await listShareSources();
+      setShareSources(sources);
+      setShareSourceViews((previous) =>
+        Object.fromEntries(
+          sources.map((source) => [
+            source.sessionId,
+            previous[source.sessionId] ?? {
+              status: "unchecked",
+              links: [],
+              notices: [],
+            },
+          ]),
+        ),
+      );
+      const sourcesToCheck = force
+        ? sources
+        : sources.filter((source) => {
+            const view = shareSourceViews[source.sessionId];
+            return (
+              view?.status !== "ready" ||
+              !view.checkedAt ||
+              Date.now() - Date.parse(view.checkedAt) > 60_000
+            );
+          });
+      let next = 0;
+      await Promise.all(
+        Array.from({ length: Math.min(4, sourcesToCheck.length) }, async () => {
+          for (;;) {
+            const index = next++;
+            if (index >= sourcesToCheck.length) return;
+            await checkShareSource(sourcesToCheck[index]!);
+          }
+        }),
+      );
+    } finally {
+      setShareSourcesRefreshing(false);
     }
   };
 
@@ -1933,12 +2664,30 @@ function App() {
   };
 
   useEffect(() => {
-    if (settingsOpen && sessionReady) void loadShareLinks();
-  }, [settingsOpen, sessionId, sessionReady]);
+    if (scenariosOpen && scenarioTab === "shares")
+      void refreshAllShareSources(false);
+  }, [scenariosOpen, scenarioTab]);
 
   useEffect(() => {
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
+      if (shareCreationUrl) {
+        setShareCreationUrl(null);
+        return;
+      }
+      if (pendingShareRevoke) {
+        setPendingShareRevoke(null);
+        return;
+      }
+
+      if (scenarioRemovalCandidate && !scenarioRemovalBusy) {
+        setScenarioRemovalCandidate(null);
+        return;
+      }
+      if (lexiconPrompt) {
+        lexiconPrompt(null);
+        return;
+      }
       setBlankPickerIndex(null);
       setSettingsOpen(false);
       setScenariosOpen(false);
@@ -1946,47 +2695,193 @@ function App() {
     };
     window.addEventListener("keydown", handleEscape);
     return () => window.removeEventListener("keydown", handleEscape);
-  }, []);
+  }, [
+    lexiconPrompt,
+    pendingShareRevoke,
+    scenarioRemovalBusy,
+    scenarioRemovalCandidate,
+    shareCreationUrl,
+  ]);
 
-  const revokeShareLink = async (shareId: string) => {
-    if (!sessionId || !sessionReady) return;
-    setShareLinkAction(shareId);
+  const revokeShareLink = async (sourceSessionId: string, shareId: string) => {
+    setShareSourceAction(`${sourceSessionId}:${shareId}`);
     try {
       const response = await fetch(
-        apiUrl(`/api/v1/sessions/${sessionId}/share/${shareId}`),
+        apiUrl(`/api/v1/sessions/${sourceSessionId}/share/${shareId}`),
         {
           method: "DELETE",
           credentials: "include",
         },
       );
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      await loadShareLinks();
-      setStatus("Share link revoked · existing forks remain independent");
+      const source = shareSources.find(
+        (item) => item.sessionId === sourceSessionId,
+      );
+      if (source) await checkShareSource(source);
     } catch {
-      setStatus("Share link could not be revoked · retry");
+      setShareSourceViews((previous) => ({
+        ...previous,
+        [sourceSessionId]: {
+          ...previous[sourceSessionId],
+          status: "unavailable",
+        },
+      }));
     } finally {
-      setShareLinkAction(null);
+      setShareSourceAction(null);
     }
   };
 
-  const dismissShareNotice = async (shareId: string) => {
-    if (!sessionId || !sessionReady) return;
-    setShareNoticeAction(shareId);
+  const dismissShareNotice = async (
+    sourceSessionId: string,
+    shareId: string,
+  ) => {
+    setShareSourceAction(`${sourceSessionId}:${shareId}`);
     try {
       const response = await fetch(
-        apiUrl(`/api/v1/sessions/${sessionId}/share-notices/${shareId}`),
+        apiUrl(`/api/v1/sessions/${sourceSessionId}/share-notices/${shareId}`),
         {
           method: "DELETE",
           credentials: "include",
         },
       );
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      await loadShareLinks();
+      const source = shareSources.find(
+        (item) => item.sessionId === sourceSessionId,
+      );
+      if (source) await checkShareSource(source);
     } catch {
-      setStatus("Share-link notice could not be dismissed · retry");
+      setShareSourceViews((previous) => ({
+        ...previous,
+        [sourceSessionId]: {
+          ...previous[sourceSessionId],
+          status: "unavailable",
+        },
+      }));
     } finally {
-      setShareNoticeAction(null);
+      setShareSourceAction(null);
     }
+  };
+
+  const confirmShareRevocation = async () => {
+    const pending = pendingShareRevoke;
+    if (!pending) return;
+    setPendingShareRevoke(null);
+    await revokeShareLink(pending.sourceSessionId, pending.shareId);
+  };
+
+  const copyShareCreationUrl = async () => {
+    if (!shareCreationUrl) return;
+    if (!navigator.clipboard?.writeText) {
+      setStatus("Clipboard unavailable · select and copy the one-time URL");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(shareCreationUrl);
+      setStatus("Share link copied · keep the URL somewhere safe");
+    } catch {
+      setStatus("Clipboard unavailable · select and copy the one-time URL");
+    }
+  };
+
+  const createShareLinkForSource = async (
+    sourceSessionId: string,
+    sourceTitle: string,
+    sourceLocalId: string | null,
+  ) => {
+    const response = await fetch(
+      apiUrl(`/api/v1/sessions/${sourceSessionId}/share`),
+      {
+        method: "POST",
+        credentials: "include",
+      },
+    );
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = (await response.json()) as {
+      share?: {
+        shareId?: unknown;
+        sourceSessionId?: unknown;
+        sourceRevision?: unknown;
+        token?: unknown;
+        expiresAt?: unknown;
+        lifetime?: unknown;
+      };
+    };
+    if (
+      !data.share ||
+      typeof data.share.shareId !== "string" ||
+      typeof data.share.sourceSessionId !== "string" ||
+      typeof data.share.token !== "string" ||
+      data.share.expiresAt !== null ||
+      data.share.lifetime !== "until_revoked"
+    ) {
+      throw new Error("invalid_share_response");
+    }
+    const shareUrl = new URL(
+      `/#/share/${data.share.sourceSessionId}/${data.share.token}`,
+      window.location.origin,
+    ).toString();
+    // Keep the one-time URL in volatile UI state immediately. It is never
+    // persisted in IndexedDB, even if a later management-list request fails.
+    setShareCreationUrl(shareUrl);
+    let managementHandleSaved = true;
+    try {
+      await rememberShareSource(
+        data.share.sourceSessionId,
+        sourceTitle,
+        sourceLocalId,
+      );
+      await loadShareSources();
+    } catch {
+      managementHandleSaved = false;
+    }
+    setShareSources((previous) =>
+      previous.some(
+        (source) => source.sessionId === data.share!.sourceSessionId,
+      )
+        ? previous
+        : [
+            {
+              sessionId: data.share!.sourceSessionId as string,
+              title: sourceTitle,
+              localId: sourceLocalId,
+              firstSeenAt: new Date().toISOString(),
+              lastSeenAt: new Date().toISOString(),
+            },
+            ...previous,
+          ],
+    );
+    try {
+      const collection = await fetchShareCollection(sourceSessionId);
+      setShareSourceViews((previous) => ({
+        ...previous,
+        [sourceSessionId]: {
+          status: "ready",
+          checkedAt: new Date().toISOString(),
+          ...collection,
+        },
+      }));
+    } catch {
+      setShareSourceViews((previous) => ({
+        ...previous,
+        [sourceSessionId]: { status: "unavailable", links: [], notices: [] },
+      }));
+    }
+    let copied = false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(shareUrl);
+        copied = true;
+      }
+    } catch {
+      copied = false;
+    }
+    setStatus(
+      managementHandleSaved
+        ? copied
+          ? "Share link created and copied · keep this one-time URL"
+          : "Share link created · copy the one-time URL"
+        : "Share link created · copy the URL now; local management data could not be saved",
+    );
   };
 
   const shareScenario = async () => {
@@ -1994,59 +2889,98 @@ function App() {
       setStatus("Session unavailable · reconnect before sharing");
       return;
     }
+    const sourceSessionId = sessionId;
+    const sourceLocalId = activeLocalIdRef.current;
+    const sourceTitle =
+      draftState.metadata?.title ??
+      scenarioList.find((scenario) => scenario.localId === sourceLocalId)
+        ?.title ??
+      "Shared scenario";
     try {
       if (scenarioDirty) {
-        const persistedRevision = await persistSession();
-        if (persistedRevision === null) throw new Error("session_conflict");
+        const persisted = await persistSession();
+        if (persisted === null) throw new Error("session_conflict");
+        if (
+          persisted.draftChangedDuringSave ||
+          draftWriteVersionRef.current !== persisted.draftVersion
+        ) {
+          throw new Error("position_changed_while_saving");
+        }
       }
-      const response = await fetch(
-        apiUrl(`/api/v1/sessions/${sessionId}/share`),
-        {
-          method: "POST",
-          credentials: "include",
-        },
-      );
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = (await response.json()) as {
-        share?: {
-          shareId?: unknown;
-          sourceSessionId?: unknown;
-          token?: unknown;
-          expiresAt?: unknown;
-          lifetime?: unknown;
-        };
-      };
       if (
-        !data.share ||
-        typeof data.share.shareId !== "string" ||
-        typeof data.share.sourceSessionId !== "string" ||
-        typeof data.share.token !== "string" ||
-        data.share.expiresAt !== null ||
-        data.share.lifetime !== "until_revoked"
+        activeLocalIdRef.current !== sourceLocalId ||
+        sessionIdRef.current !== sourceSessionId
       )
-        throw new Error("invalid_share_response");
-      const shareUrl = new URL(
-        `/#/share/${data.share.sourceSessionId}/${data.share.token}`,
-        window.location.origin,
-      ).toString();
-      let copied = true;
-      try {
-        await navigator.clipboard?.writeText(shareUrl);
-      } catch {
-        copied = false;
-      }
-      void loadShareLinks();
-      setStatus(
-        copied
-          ? "Permanent share link copied · recipients get independent forks"
-          : "Permanent share link created · clipboard unavailable",
+        return;
+      await createShareLinkForSource(
+        sourceSessionId,
+        sourceTitle,
+        sourceLocalId,
       );
     } catch (error) {
+      if (
+        activeLocalIdRef.current !== sourceLocalId ||
+        sessionIdRef.current !== sourceSessionId
+      )
+        return;
       setStatus(
         error instanceof Error && error.message === "session_conflict"
           ? "Session changed · reconnect before sharing"
-          : "Share link unavailable · retry",
+          : error instanceof Error &&
+              error.message === "position_changed_while_saving"
+            ? "Position changed while saving · share again"
+            : "Share link unavailable · retry",
       );
+    }
+  };
+
+  const createShareFromManager = async (source: ShareSourceRecord) => {
+    setShareSourceAction(`${source.sessionId}:create`);
+    try {
+      if (source.localId !== null && source.localId === activeLocalId) {
+        if (!sessionReady || sessionId !== source.sessionId)
+          throw new Error("source_session_unavailable");
+        if (scenarioDirty) {
+          const persisted = await persistSession();
+          if (persisted === null) throw new Error("session_conflict");
+          if (
+            persisted.draftChangedDuringSave ||
+            draftWriteVersionRef.current !== persisted.draftVersion
+          ) {
+            throw new Error("position_changed_while_saving");
+          }
+        }
+      } else if (source.localId) {
+        const savedScenario = await getScenario(source.localId);
+        if (savedScenario?.dirty) throw new Error("local_changes");
+      }
+      await createShareLinkForSource(
+        source.sessionId,
+        source.title,
+        source.localId,
+      );
+    } catch (error) {
+      if (error instanceof Error && error.message === "local_changes") {
+        setStatus(
+          "Open this scenario and analyze/save its local changes before sharing them",
+        );
+      } else if (
+        error instanceof Error &&
+        error.message === "session_conflict"
+      ) {
+        setStatus("Session changed · reconnect before sharing");
+      } else if (
+        error instanceof Error &&
+        error.message === "position_changed_while_saving"
+      ) {
+        setStatus("Position changed while saving · share again");
+      } else {
+        setStatus(
+          "Could not create a link from this source · check owner access and retry",
+        );
+      }
+    } finally {
+      setShareSourceAction(null);
     }
   };
 
@@ -2374,10 +3308,22 @@ function App() {
   const pollDeepJob = async (
     jobId: string,
     signal: AbortSignal,
+    requestSessionId: string,
+    requestLocalId: string | null,
+    requestDraftVersion: number,
   ): Promise<void> => {
     for (;;) {
+      if (
+        sessionIdRef.current !== requestSessionId ||
+        activeLocalIdRef.current !== requestLocalId
+      ) {
+        throw new Error("scenario_switched_during_analysis");
+      }
+      if (draftWriteVersionRef.current !== requestDraftVersion) {
+        throw new Error("position_changed_during_analysis");
+      }
       const response = await fetch(
-        apiUrl(`/api/v1/sessions/${sessionId}/analysis/jobs/${jobId}`),
+        apiUrl(`/api/v1/sessions/${requestSessionId}/analysis/jobs/${jobId}`),
         {
           credentials: "include",
           signal,
@@ -2385,6 +3331,15 @@ function App() {
       );
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = (await response.json()) as AnalysisJobResponse;
+      if (
+        sessionIdRef.current !== requestSessionId ||
+        activeLocalIdRef.current !== requestLocalId
+      ) {
+        throw new Error("scenario_switched_during_analysis");
+      }
+      if (draftWriteVersionRef.current !== requestDraftVersion) {
+        throw new Error("position_changed_during_analysis");
+      }
       const job = data.job;
       if (job.status === "queued") {
         setAnalysisPhase("queued");
@@ -2459,6 +3414,8 @@ function App() {
       setMoves([]);
       return;
     }
+    const requestSessionId = sessionId;
+    const requestLocalId = activeLocalIdRef.current;
     const controller = new AbortController();
     analysisAbortRef.current = controller;
     setAnalyzing(true);
@@ -2466,14 +3423,22 @@ function App() {
     setStatus("Saving position…");
     let warmingTimer: number | undefined;
     try {
-      const persistedRevision = await persistSession();
-      if (persistedRevision === null) throw new Error("session_conflict");
+      const persisted = await persistSession();
+      if (persisted === null) throw new Error("session_conflict");
+      if (
+        persisted.draftChangedDuringSave ||
+        draftWriteVersionRef.current !== persisted.draftVersion
+      ) {
+        throw new Error("position_changed_before_analysis");
+      }
+      const persistedRevision = persisted.revision;
+      const requestDraftVersion = persisted.draftVersion;
       if (analysisMode === "deep") {
         setAnalysisPhase("queued");
         setStatus("Queueing deep analysis…");
         const idempotencyKey = crypto.randomUUID();
         const response = await fetch(
-          apiUrl(`/api/v1/sessions/${sessionId}/analysis/jobs`),
+          apiUrl(`/api/v1/sessions/${requestSessionId}/analysis/jobs`),
           {
             method: "POST",
             credentials: "include",
@@ -2491,7 +3456,31 @@ function App() {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const created = (await response.json()) as AnalysisJobResponse;
         activeJobIdRef.current = created.job.id;
-        await pollDeepJob(created.job.id, controller.signal);
+        if (
+          sessionIdRef.current !== requestSessionId ||
+          activeLocalIdRef.current !== requestLocalId
+        ) {
+          throw new Error("scenario_switched_during_analysis");
+        }
+        if (draftWriteVersionRef.current !== requestDraftVersion) {
+          await fetch(
+            apiUrl(
+              `/api/v1/sessions/${requestSessionId}/analysis/jobs/${created.job.id}`,
+            ),
+            {
+              method: "DELETE",
+              credentials: "include",
+            },
+          ).catch(() => undefined);
+          throw new Error("position_changed_during_analysis");
+        }
+        await pollDeepJob(
+          created.job.id,
+          controller.signal,
+          requestSessionId,
+          requestLocalId,
+          requestDraftVersion,
+        );
       } else {
         setAnalysisPhase("starting");
         setStatus("Starting analysis engine…");
@@ -2500,7 +3489,7 @@ function App() {
           setStatus("Waking analysis engine…");
         }, 900);
         const response = await fetch(
-          apiUrl(`/api/v1/sessions/${sessionId}/moves/generate`),
+          apiUrl(`/api/v1/sessions/${requestSessionId}/moves/generate`),
           {
             method: "POST",
             credentials: "include",
@@ -2529,6 +3518,15 @@ function App() {
           throw new Error(`HTTP ${response.status}`);
         }
         const result = await response.json();
+        if (
+          sessionIdRef.current !== requestSessionId ||
+          activeLocalIdRef.current !== requestLocalId
+        ) {
+          throw new Error("scenario_switched_during_analysis");
+        }
+        if (draftWriteVersionRef.current !== requestDraftVersion) {
+          throw new Error("position_changed_during_analysis");
+        }
         setMoves(Array.isArray(result?.moves) ? result.moves : []);
         setBoardWarnings(warningWords(result?.boardWarnings));
         setSelectedMoveIndex(null);
@@ -2541,6 +3539,40 @@ function App() {
       setRetryAvailable(true);
       if (error instanceof Error && error.message === "engine_wake_failed") {
         setStatus("Engine unavailable after wake-up · retry");
+      } else if (
+        error instanceof Error &&
+        error.message === "position_changed_before_analysis"
+      ) {
+        setRetryAvailable(false);
+        setStatus(
+          "Position changed while saving · analyze the current position",
+        );
+      } else if (
+        error instanceof Error &&
+        error.message === "position_changed_during_analysis"
+      ) {
+        const jobId = activeJobIdRef.current;
+        if (jobId) {
+          await fetch(
+            apiUrl(
+              `/api/v1/sessions/${requestSessionId}/analysis/jobs/${jobId}`,
+            ),
+            {
+              method: "DELETE",
+              credentials: "include",
+            },
+          ).catch(() => undefined);
+        }
+        setRetryAvailable(false);
+        setStatus(
+          "Position changed during analysis · stale results were discarded",
+        );
+      } else if (
+        error instanceof Error &&
+        error.message === "scenario_switched_during_analysis"
+      ) {
+        setRetryAvailable(false);
+        setStatus("Scenario changed · stale analysis results were discarded");
       } else if (
         error instanceof Error &&
         error.message === "session_conflict"
@@ -2601,6 +3633,15 @@ function App() {
         ? "Analyze position"
         : "Starting session…";
   const lexicon = LEXICON_DETAILS[draftState.lexiconId];
+  const displayedScenarios = scenarioList.filter(
+    (scenario, index) =>
+      index < MAX_LOCAL_SCENARIOS ||
+      scenario.dirty ||
+      scenario.localId === activeLocalId,
+  );
+  // Keep zero-link sources visible so owners can create a replacement link
+  // from the manager even after revoking the last link.
+  const displayedShareSources = shareSources;
 
   return (
     <div class="app-shell">
@@ -2680,6 +3721,20 @@ function App() {
             Forked from shared scenario revision{" "}
             {draftState.metadata.forkedFrom.sourceRevision}. This session is
             independent.
+          </p>
+        )}
+
+        {orphanedScenarioTitle && (
+          <p class="fork-note orphaned-scenario-note" role="status">
+            “{orphanedScenarioTitle}” changed or was removed in another tab.
+            Your open draft is still here.
+            <button
+              class="text-button"
+              type="button"
+              onClick={saveOrphanedScenarioCopy}
+            >
+              Save a copy
+            </button>
           </p>
         )}
 
@@ -3180,14 +4235,20 @@ function App() {
             {!sessionReady && (
               <div class="reconnect-row" role="status" aria-live="polite">
                 <span>
-                  Draft stays on this device while the session reconnects.
+                  {orphanedScenarioTitle
+                    ? "This open draft no longer has a saved scenario handle."
+                    : "Draft stays on this device while the session reconnects."}
                 </span>
                 <button
                   class="text-button"
                   type="button"
-                  onClick={reconnectSession}
+                  onClick={
+                    orphanedScenarioTitle
+                      ? saveOrphanedScenarioCopy
+                      : reconnectSession
+                  }
                 >
-                  Reconnect session
+                  {orphanedScenarioTitle ? "Save a copy" : "Reconnect session"}
                 </button>
               </div>
             )}
@@ -3475,80 +4536,25 @@ function App() {
                 onChange={(event) => void importGcg(event)}
               />
             </div>
-            <p class="share-disclosure">
-              Share links are permanent until revoked. Up to 100 remain active;
-              creating another automatically removes the oldest. Anyone with a
-              link can create independent forks, and revoking does not change
-              existing ones.
-            </p>
-            <section class="share-links-section" aria-label="Shared links">
-              <div class="share-links-heading">
-                <strong>Shared links</strong>
-                <button
-                  class="text-button"
-                  type="button"
-                  onClick={() => void loadShareLinks()}
-                  disabled={shareLinksLoading}
-                >
-                  {shareLinksLoading ? "Refreshing…" : "Refresh"}
-                </button>
-              </div>
-              {shareNotices.map((notice) => (
-                <div
-                  class="share-link-notice"
-                  key={notice.shareId}
-                  role="status"
-                >
-                  <div>
-                    <strong>Share link removed automatically</strong>
-                    <small>
-                      Revision {notice.sourceRevision} ·{" "}
-                      {notice.reason === "storage_limit"
-                        ? "storage pressure"
-                        : "100-link limit"}{" "}
-                      · created {scenarioTimeLabel(notice.createdAt)}
-                    </small>
-                  </div>
-                  <button
-                    class="text-button"
-                    type="button"
-                    onClick={() => void dismissShareNotice(notice.shareId)}
-                    disabled={shareNoticeAction !== null}
-                  >
-                    {shareNoticeAction === notice.shareId
-                      ? "Dismissing…"
-                      : "Dismiss"}
-                  </button>
-                </div>
-              ))}
-              {shareLinks.length === 0 && !shareLinksLoading && (
-                <p class="scenario-empty">No active share links.</p>
-              )}
-              <div class="share-links-list">
-                {shareLinks.map((share) => (
-                  <div class="share-link-row" key={share.shareId}>
-                    <div>
-                      <strong>Revision {share.sourceRevision}</strong>
-                      <small>
-                        Permanent · {share.useCount}{" "}
-                        {share.useCount === 1 ? "fork" : "forks"} · created{" "}
-                        {scenarioTimeLabel(share.createdAt)}
-                      </small>
-                    </div>
-                    <button
-                      class="text-button"
-                      type="button"
-                      onClick={() => void revokeShareLink(share.shareId)}
-                      disabled={shareLinkAction !== null}
-                    >
-                      {shareLinkAction === share.shareId
-                        ? "Revoking…"
-                        : "Revoke"}
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </section>
+            <div class="share-disclosure">
+              <p>
+                Links have no scheduled expiry, but per-session limits may
+                remove the oldest automatically. Anyone with a link can create
+                an independent fork; revoking a link does not change existing
+                forks. The link is shown only once when created.
+              </p>
+              <button
+                class="text-button"
+                type="button"
+                onClick={() => {
+                  setSettingsOpen(false);
+                  setScenariosOpen(true);
+                  setScenarioTab("shares");
+                }}
+              >
+                Manage share links
+              </button>
+            </div>
             <label>
               Cross-Tables game URL
               <input
@@ -3607,8 +4613,8 @@ function App() {
           >
             <div class="drawer-heading">
               <div>
-                <span class="eyebrow">LOCAL SCENARIOS</span>
-                <h2 id="scenarios-title">Recent scenarios</h2>
+                <span class="eyebrow">SCENARIOS & SHARING</span>
+                <h2 id="scenarios-title">Your workspace</h2>
               </div>
               <button
                 class="icon-button"
@@ -3619,64 +4625,511 @@ function App() {
                 ×
               </button>
             </div>
-            <div class="scenario-create-actions">
+            <div
+              class="scenario-tabs"
+              role="tablist"
+              aria-label="Workspace lists"
+            >
               <button
-                class="primary-button scenario-new-button"
                 type="button"
-                onClick={createNewGame}
-                disabled={scenarioBusy}
+                role="tab"
+                aria-selected={scenarioTab === "scenarios"}
+                onClick={() => setScenarioTab("scenarios")}
               >
-                New game <small>random opening rack</small>
+                Scenarios
               </button>
               <button
-                class="secondary-button scenario-new-button"
                 type="button"
-                onClick={createBlankPosition}
-                disabled={scenarioBusy}
+                role="tab"
+                aria-selected={scenarioTab === "shares"}
+                onClick={() => setScenarioTab("shares")}
               >
-                Blank position
+                Share links
               </button>
             </div>
-            <p class="scenario-note">
-              New game starts with an empty board and a fresh random rack, like
-              Quackle. Use Blank position to set up a historical or hypothetical
-              position manually.
-            </p>
-            <p class="scenario-note">
-              This browser remembers the {MAX_LOCAL_SCENARIOS} most recent
-              scenarios. Local drafts stay available if a session is offline or
-              expires.
-            </p>
-            <div class="scenario-list" aria-label="Recent scenarios">
-              {scenarioList.slice(0, MAX_LOCAL_SCENARIOS).map((scenario) => (
+            {orphanedScenarioTitle && (
+              <p class="fork-note orphaned-scenario-note" role="status">
+                “{orphanedScenarioTitle}” changed or was removed in another tab;
+                this tab still has the open draft.
                 <button
-                  class={`scenario-item ${scenario.localId === activeLocalId ? "active" : ""}`}
+                  class="text-button"
                   type="button"
-                  key={scenario.localId}
-                  onClick={() => void activateScenario(scenario)}
-                  disabled={scenarioBusy}
-                  aria-current={
-                    scenario.localId === activeLocalId ? "true" : undefined
-                  }
-                  aria-label={`Open scenario ${scenario.title}`}
+                  onClick={saveOrphanedScenarioCopy}
                 >
-                  <span class="scenario-item-main">
-                    <strong>{scenario.title}</strong>
-                    <small>
-                      {scenarioKindLabel(scenario.kind)} ·{" "}
-                      {scenarioTileCount(scenario.state)} tiles ·{" "}
-                      {scenario.dirty ? "local changes" : "saved"}
-                    </small>
-                  </span>
-                  <span class="scenario-item-meta">
-                    {scenarioTimeLabel(scenario.lastOpenedAt)}
-                    {scenario.localId === activeLocalId ? " · current" : ""}
-                  </span>
+                  Save a copy
                 </button>
-              ))}
-              {scenarioList.length === 0 && (
-                <p class="scenario-empty">No saved scenarios yet.</p>
-              )}
+              </p>
+            )}
+            {scenarioTab === "scenarios" ? (
+              <>
+                <div class="scenario-create-actions">
+                  <button
+                    class="primary-button scenario-new-button"
+                    type="button"
+                    onClick={createNewGame}
+                    disabled={scenarioBusy || scenarioRemovalBusy}
+                  >
+                    New game <small>random opening rack</small>
+                  </button>
+                  <button
+                    class="secondary-button scenario-new-button"
+                    type="button"
+                    onClick={createBlankPosition}
+                    disabled={scenarioBusy || scenarioRemovalBusy}
+                  >
+                    Blank position
+                  </button>
+                </div>
+                <p class="scenario-note">
+                  New game starts with an empty board and a fresh random rack,
+                  like Quackle. Use Blank position to set up a historical or
+                  hypothetical position manually.
+                </p>
+                <p class="scenario-note">
+                  This browser shows the {MAX_LOCAL_SCENARIOS} most recent
+                  scenarios plus any local drafts and the current one. Removing
+                  a saved copy here does not revoke share links or remove
+                  recipient forks.
+                </p>
+                {undoScenarioDeletion && (
+                  <div class="scenario-undo" role="status">
+                    <span>
+                      Removed “{undoScenarioDeletion.scenario.title}” from this
+                      browser. Shares are unchanged.
+                    </span>
+                    <button
+                      class="text-button"
+                      type="button"
+                      onClick={() => void undoScenarioRemoval()}
+                      disabled={scenarioRemovalBusy}
+                    >
+                      Undo
+                    </button>
+                  </div>
+                )}
+                <div class="scenario-list" aria-label="Recent scenarios">
+                  {displayedScenarios.map((scenario) => (
+                    <div
+                      class={`scenario-item ${scenario.localId === activeLocalId ? "active" : ""}`}
+                      key={scenario.localId}
+                      data-local-scenario-id={scenario.localId}
+                    >
+                      <button
+                        class="scenario-item-open"
+                        type="button"
+                        onClick={() => void activateScenario(scenario)}
+                        disabled={scenarioBusy || scenarioRemovalBusy}
+                        aria-current={
+                          scenario.localId === activeLocalId
+                            ? "true"
+                            : undefined
+                        }
+                        aria-label={`Open scenario ${scenario.title}`}
+                      >
+                        <span class="scenario-item-main">
+                          <strong>{scenario.title}</strong>
+                          <small>
+                            {scenarioKindLabel(scenario.kind)} ·{" "}
+                            {scenarioTileCount(scenario.state)} tiles ·{" "}
+                            {scenario.dirty ? "local changes" : "saved"}
+                          </small>
+                        </span>
+                        <span class="scenario-item-meta">
+                          {scenarioTimeLabel(scenario.lastOpenedAt)}
+                          {scenario.localId === activeLocalId
+                            ? " · current"
+                            : ""}
+                        </span>
+                      </button>
+                      <button
+                        class="scenario-remove-button"
+                        type="button"
+                        onClick={() => setScenarioRemovalCandidate(scenario)}
+                        disabled={scenarioBusy || scenarioRemovalBusy}
+                        aria-label={`Remove scenario ${scenario.title} from this browser`}
+                        title="Remove from this browser"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                  {displayedScenarios.length === 0 && (
+                    <p class="scenario-empty">No saved scenarios yet.</p>
+                  )}
+                </div>
+              </>
+            ) : (
+              <section class="share-manager" aria-label="Share link management">
+                <p class="scenario-note">
+                  Links have no scheduled expiry, but per-session quotas may
+                  remove the oldest automatically. This manager stores
+                  source-session handles only—not bearer URLs, share tokens, or
+                  capability cookies. Each source's owner cookie renews when
+                  that source is successfully checked/used and expires after 30
+                  days without a request to that source; the link may still work
+                  if owner access is unavailable.
+                </p>
+                <div class="share-links-heading">
+                  <strong>Known share sources</strong>
+                  <button
+                    class="text-button"
+                    type="button"
+                    onClick={() => void refreshAllShareSources()}
+                    disabled={
+                      shareSources.length === 0 ||
+                      shareSourcesLoading ||
+                      shareSourcesRefreshing ||
+                      shareSourceAction !== null
+                    }
+                  >
+                    {shareSourcesLoading
+                      ? "Loading…"
+                      : shareSourcesRefreshing
+                        ? "Checking…"
+                        : "Refresh all"}
+                  </button>
+                </div>
+                <div class="share-source-list">
+                  {displayedShareSources.map((source) => {
+                    const view = shareSourceViews[source.sessionId] ?? {
+                      status: "unchecked" as const,
+                      links: [],
+                      notices: [],
+                    };
+                    const actionPending =
+                      shareSourceAction?.startsWith(`${source.sessionId}:`) ??
+                      false;
+                    const viewLabel =
+                      view.status === "unchecked"
+                        ? "Not checked"
+                        : view.status === "checking"
+                          ? "Checking…"
+                          : view.status === "ready"
+                            ? `${view.links.length} active ${view.links.length === 1 ? "link" : "links"}`
+                            : view.status === "offline"
+                              ? "Offline · link status unknown"
+                              : "Owner access unavailable · link status unknown";
+                    return (
+                      <article class="share-source-card" key={source.sessionId}>
+                        <div class="share-source-heading">
+                          <div>
+                            <strong>{source.title}</strong>
+                            <small>
+                              {source.localId
+                                ? "Saved scenario"
+                                : "Source scenario removed from this browser"}{" "}
+                              · {viewLabel}
+                              {view.checkedAt
+                                ? ` · checked ${scenarioTimeLabel(view.checkedAt)}`
+                                : ""}
+                            </small>
+                          </div>
+                          <div class="share-source-actions">
+                            <button
+                              class="text-button"
+                              type="button"
+                              onClick={() => void checkShareSource(source)}
+                              disabled={
+                                actionPending || view.status === "checking"
+                              }
+                            >
+                              {view.status === "checking"
+                                ? "Checking…"
+                                : view.status === "ready"
+                                  ? "Refresh"
+                                  : "Check"}
+                            </button>
+                            {view.status === "ready" && (
+                              <button
+                                class="text-button"
+                                type="button"
+                                onClick={() =>
+                                  void createShareFromManager(source)
+                                }
+                                disabled={actionPending}
+                              >
+                                {shareSourceAction ===
+                                `${source.sessionId}:create`
+                                  ? "Creating…"
+                                  : view.links.length > 0
+                                    ? "Create another link"
+                                    : "Create link"}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                        {!source.localId && view.status === "ready" && (
+                          <p class="share-manager-warning">
+                            Creating a link shares the source session’s last
+                            saved server snapshot. It cannot recover an older
+                            URL or include unsaved changes from the removed
+                            local scenario.
+                          </p>
+                        )}
+                        {(view.status === "offline" ||
+                          view.status === "unavailable") && (
+                          <p class="share-manager-warning">
+                            The source could not be authorized. The share link
+                            may still work; reconnect to verify or revoke it.
+                          </p>
+                        )}
+                        {view.notices.map((notice) => (
+                          <div
+                            class="share-link-notice"
+                            key={notice.shareId}
+                            role="status"
+                          >
+                            <div>
+                              <strong>Link removed automatically</strong>
+                              <small>
+                                Revision {notice.sourceRevision} ·{" "}
+                                {notice.reason === "storage_limit"
+                                  ? "storage pressure"
+                                  : "active-link limit"}{" "}
+                                · created {scenarioTimeLabel(notice.createdAt)}
+                              </small>
+                            </div>
+                            <button
+                              class="text-button"
+                              type="button"
+                              onClick={() =>
+                                void dismissShareNotice(
+                                  source.sessionId,
+                                  notice.shareId,
+                                )
+                              }
+                              disabled={actionPending}
+                            >
+                              {shareSourceAction ===
+                              `${source.sessionId}:${notice.shareId}`
+                                ? "Dismissing…"
+                                : "Dismiss"}
+                            </button>
+                          </div>
+                        ))}
+                        {view.links.map((share) => (
+                          <div class="share-link-row" key={share.shareId}>
+                            <div>
+                              <strong>Revision {share.sourceRevision}</strong>
+                              <small>
+                                No scheduled expiry · {share.useCount}{" "}
+                                {share.useCount === 1 ? "fork" : "forks"} ·
+                                created {scenarioTimeLabel(share.createdAt)}
+                              </small>
+                            </div>
+                            <button
+                              class="text-button destructive-text-button"
+                              type="button"
+                              onClick={() =>
+                                setPendingShareRevoke({
+                                  sourceSessionId: source.sessionId,
+                                  shareId: share.shareId,
+                                  title: source.title,
+                                })
+                              }
+                              disabled={actionPending}
+                            >
+                              Revoke
+                            </button>
+                          </div>
+                        ))}
+                      </article>
+                    );
+                  })}
+                  {displayedShareSources.length === 0 &&
+                    !shareSourcesLoading && (
+                      <p class="scenario-empty">
+                        {shareSources.length > 0
+                          ? "No active links in the checked sources. Create a new link from a source here or from scenario settings."
+                          : "No known share sources. Create a share link from a scenario to manage it here."}
+                      </p>
+                    )}
+                </div>
+              </section>
+            )}
+          </section>
+        </div>
+      )}
+      {scenarioRemovalCandidate && (
+        <div
+          class="drawer-backdrop choice-backdrop"
+          role="presentation"
+          onClick={() =>
+            !scenarioRemovalBusy && setScenarioRemovalCandidate(null)
+          }
+        >
+          <section
+            class="blank-picker confirm-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="scenario-remove-title"
+            aria-describedby="scenario-remove-copy"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div class="drawer-heading">
+              <div>
+                <span class="eyebrow">LOCAL SCENARIO</span>
+                <h2 id="scenario-remove-title">Remove from this browser?</h2>
+              </div>
+              <button
+                class="icon-button"
+                type="button"
+                onClick={() => setScenarioRemovalCandidate(null)}
+                aria-label="Cancel removal"
+                disabled={scenarioRemovalBusy}
+              >
+                ×
+              </button>
+            </div>
+            <p id="scenario-remove-copy" class="about-lede">
+              “{scenarioRemovalCandidate.title}” and its saved board/history
+              will be removed from this browser.
+              {scenarioRemovalCandidate.dirty
+                ? " It has local changes that may not be in the server session."
+                : ""}{" "}
+              Share links, server-side snapshots, and existing recipient forks
+              are not revoked or deleted. Manage links in the Share links tab.
+            </p>
+            {scenarioRemovalCandidate.localId === activeLocalId && (
+              <p class="scenario-note">
+                This is the current scenario. We’ll open another saved scenario,
+                or start a fresh game if this is the last one.
+              </p>
+            )}
+            <div class="action-row confirm-actions">
+              <button
+                class="secondary-button"
+                type="button"
+                onClick={() => setScenarioRemovalCandidate(null)}
+                disabled={scenarioRemovalBusy}
+              >
+                Cancel
+              </button>
+              <button
+                class="danger-button"
+                type="button"
+                onClick={() => void removeScenarioFromBrowser()}
+                disabled={scenarioRemovalBusy}
+              >
+                {scenarioRemovalBusy ? "Removing…" : "Remove from this browser"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+      {pendingShareRevoke && (
+        <div
+          class="drawer-backdrop choice-backdrop"
+          role="presentation"
+          onClick={() => setPendingShareRevoke(null)}
+        >
+          <section
+            class="blank-picker confirm-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="share-revoke-title"
+            aria-describedby="share-revoke-copy"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div class="drawer-heading">
+              <div>
+                <span class="eyebrow">SHARE LINK</span>
+                <h2 id="share-revoke-title">Revoke this link?</h2>
+              </div>
+              <button
+                class="icon-button"
+                type="button"
+                onClick={() => setPendingShareRevoke(null)}
+                aria-label="Cancel revocation"
+              >
+                ×
+              </button>
+            </div>
+            <p id="share-revoke-copy" class="about-lede">
+              Future forks from “{pendingShareRevoke.title}” will be blocked.
+              Existing recipient copies stay independent. This cannot be undone;
+              sharing again creates a different URL.
+            </p>
+            <div class="action-row confirm-actions">
+              <button
+                class="secondary-button"
+                type="button"
+                onClick={() => setPendingShareRevoke(null)}
+              >
+                Keep link
+              </button>
+              <button
+                class="danger-button"
+                type="button"
+                onClick={() => void confirmShareRevocation()}
+                disabled={shareSourceAction !== null}
+              >
+                Revoke link
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {shareCreationUrl && (
+        <div
+          class="drawer-backdrop choice-backdrop"
+          role="presentation"
+          onClick={() => setShareCreationUrl(null)}
+        >
+          <section
+            class="blank-picker confirm-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="share-created-title"
+            aria-describedby="share-created-copy"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div class="drawer-heading">
+              <div>
+                <span class="eyebrow">ONE-TIME LINK</span>
+                <h2 id="share-created-title">Share scenario</h2>
+              </div>
+              <button
+                class="icon-button"
+                type="button"
+                onClick={() => setShareCreationUrl(null)}
+                aria-label="Close share link"
+              >
+                ×
+              </button>
+            </div>
+            <p id="share-created-copy" class="about-lede">
+              Anyone with this URL can create an independent copy. This one-time
+              URL is shown only now and is not saved in this browser’s manager;
+              creating another link later makes a different URL.
+            </p>
+            <label class="share-url-label">
+              Copy and keep this link
+              <input
+                class="share-url-input"
+                type="text"
+                readonly
+                value={shareCreationUrl}
+                onFocus={(event) => event.currentTarget.select()}
+                aria-label="One-time share URL"
+              />
+            </label>
+            <div class="action-row confirm-actions">
+              <button
+                class="secondary-button"
+                type="button"
+                onClick={() => setShareCreationUrl(null)}
+              >
+                Done
+              </button>
+              <button
+                class="primary-button"
+                type="button"
+                onClick={() => void copyShareCreationUrl()}
+              >
+                Copy link
+              </button>
             </div>
           </section>
         </div>

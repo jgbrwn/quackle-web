@@ -19,7 +19,8 @@ ships the contract but not the hosted service implementation.
 - `DELETE /api/v1/sessions/{id}/share-notices/{shareId}` — dismiss an automatic
   eviction notice.
 - `POST /api/v1/shares/redeem` — redeem a fragment token and create an
-  independent session/capability.
+  independent session/capability; the browser strips the fragment from history
+  before the request begins.
 - `POST /api/v1/imports/gcg` — validate imported GCG before session creation.
 - `POST /api/v1/imports/cross-tables` — service-side import of one allowlisted
   Cross-Tables annotated game (Cross-Tables sends no CORS headers). Returns the
@@ -33,6 +34,16 @@ clients must reconcile by revision/sequence after reconnecting.
 A compatible service must issue an authorization capability through a secure,
 HttpOnly cookie or an equivalent mechanism. Session IDs are routing handles, not
 credentials. Do not put capabilities, job leases, or raw uploaded lists in URLs.
+The current browser service uses a per-session HttpOnly capability cookie with
+a 30-day idle lifetime, renewed only after a successful authorized session HTTP
+response. Share-fragment bearer URLs are separate: the owner cookie controls
+management, not redemption, and its expiry does not expire the share URL.
+
+Removing a local scenario is a browser-only IndexedDB action and does not call
+a server-delete endpoint or revoke a snapshot share. Revocation remains a
+separate owner-authorized `DELETE /api/v1/sessions/{id}/share/{shareId}` request.
+The browser retains known source handles after the last link is revoked, so a
+replacement link can be created from the Share links manager.
 
 All mutations use an expected revision or idempotency key. Imported files are
 bounded text data, never filenames, paths, archives, commands, or configuration.

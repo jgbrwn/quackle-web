@@ -8,6 +8,8 @@ export type ScenarioSource =
 export interface ScenarioRecord {
   schemaVersion: 1;
   localId: string;
+  /** Local-only generation counter; never sent to the Worker or exported. */
+  localGeneration?: number;
   sessionId: string | null;
   kind: ScenarioKind;
   title: string;
@@ -20,14 +22,43 @@ export interface ScenarioRecord {
   source?: ScenarioSource;
 }
 
+/**
+ * Local management handle for a source session. It contains no capability or
+ * share bearer token, and survives removal/pruning of the scenario itself.
+ */
+export interface ShareSourceRecord {
+  sessionId: string;
+  title: string;
+  localId: string | null;
+  firstSeenAt: string;
+  lastSeenAt: string;
+}
+
+export interface DeletedScenario {
+  scenario: ScenarioRecord;
+  generation: number;
+  deletionId: string;
+  deletedAt: string;
+  shareSources: ShareSourceRecord[];
+}
+
+export type ScenarioStoreEvent =
+  | { type: "removed"; localIds: string[] }
+  | { type: "restored"; localId: string }
+  | { type: "sources-changed"; sessionId: string };
+
 const DATABASE_NAME = "quackle-web-drafts";
-const DATABASE_VERSION = 2;
+const DATABASE_VERSION = 3;
 const DRAFT_STORE_NAME = "drafts";
 const SCENARIO_STORE_NAME = "scenarios";
+const SHARE_SOURCE_STORE_NAME = "shareSources";
 const META_STORE_NAME = "meta";
 const LEGACY_ACTIVE_KEY = "active";
 const LEGACY_SCENARIO_ID = "legacy-active";
 const ACTIVE_SCENARIO_KEY = "activeScenario";
+const SCENARIO_TOMBSTONE_PREFIX = "scenario-deleted:";
+const SCENARIO_GENERATION_PREFIX = "scenario-generation:";
+const SCENARIO_CHANNEL_NAME = "quackle-web-scenarios";
 export const MAX_LOCAL_SCENARIOS = 100;
 
 function now(): string {
@@ -38,6 +69,56 @@ export function newScenarioId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function")
     return crypto.randomUUID();
   return `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+function validSessionId(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{20,128}$/.test(value);
+}
+
+function tombstoneKey(localId: string): string {
+  return `${SCENARIO_TOMBSTONE_PREFIX}${localId}`;
+}
+
+function generationKey(localId: string): string {
+  return `${SCENARIO_GENERATION_PREFIX}${localId}`;
+}
+
+function sourceRecord(
+  scenario: Pick<ScenarioRecord, "localId" | "sessionId" | "title">,
+  existing?: ShareSourceRecord,
+): ShareSourceRecord | null {
+  if (!validSessionId(scenario.sessionId)) return null;
+  const timestamp = now();
+  return {
+    sessionId: scenario.sessionId,
+    title: scenario.title.slice(0, 128),
+    localId: scenario.localId,
+    firstSeenAt: existing?.firstSeenAt ?? timestamp,
+    lastSeenAt: timestamp,
+  };
+}
+
+function publishScenarioEvent(event: ScenarioStoreEvent): void {
+  if (typeof BroadcastChannel === "undefined") return;
+  const channel = new BroadcastChannel(SCENARIO_CHANNEL_NAME);
+  channel.postMessage(event);
+  channel.close();
+}
+
+export function subscribeToScenarioEvents(
+  listener: (event: ScenarioStoreEvent) => void,
+): () => void {
+  if (typeof BroadcastChannel === "undefined") return () => undefined;
+  const channel = new BroadcastChannel(SCENARIO_CHANNEL_NAME);
+  channel.onmessage = (event: MessageEvent<ScenarioStoreEvent>) => {
+    if (
+      event.data &&
+      ["removed", "restored", "sources-changed"].includes(event.data.type)
+    ) {
+      listener(event.data);
+    }
+  };
+  return () => channel.close();
 }
 
 function openDatabase(): Promise<IDBDatabase> {
@@ -63,6 +144,11 @@ function openDatabase(): Promise<IDBDatabase> {
         store.createIndex("sessionId", "sessionId", { unique: false });
         store.createIndex("lastOpenedAt", "lastOpenedAt", { unique: false });
       }
+      if (!database.objectStoreNames.contains(SHARE_SOURCE_STORE_NAME)) {
+        database.createObjectStore(SHARE_SOURCE_STORE_NAME, {
+          keyPath: "sessionId",
+        });
+      }
       if (!database.objectStoreNames.contains(META_STORE_NAME))
         database.createObjectStore(META_STORE_NAME);
 
@@ -85,6 +171,7 @@ function openDatabase(): Promise<IDBDatabase> {
           const scenario: ScenarioRecord = {
             schemaVersion: 1,
             localId: LEGACY_SCENARIO_ID,
+            localGeneration: 0,
             sessionId:
               typeof legacy.sessionId === "string" ? legacy.sessionId : null,
             kind: "new",
@@ -101,10 +188,41 @@ function openDatabase(): Promise<IDBDatabase> {
           transaction
             .objectStore(META_STORE_NAME)
             .put({ localId: LEGACY_SCENARIO_ID }, ACTIVE_SCENARIO_KEY);
+          const source = sourceRecord(scenario);
+          if (source)
+            transaction.objectStore(SHARE_SOURCE_STORE_NAME).put(source);
+        };
+      }
+      if (oldVersion < 3) {
+        const scenarios = transaction.objectStore(SCENARIO_STORE_NAME);
+        const shareSources = transaction.objectStore(SHARE_SOURCE_STORE_NAME);
+        const cursorRequest = scenarios.openCursor();
+        cursorRequest.onsuccess = () => {
+          const cursor = cursorRequest.result;
+          if (!cursor) return;
+          const scenario = cursor.value as ScenarioRecord;
+          const generation =
+            Number.isInteger(scenario.localGeneration) &&
+            (scenario.localGeneration ?? 0) >= 0
+              ? scenario.localGeneration!
+              : 0;
+          if (scenario.localGeneration !== generation) {
+            cursor.update({ ...scenario, localGeneration: generation });
+          }
+          const source = sourceRecord({
+            localId: scenario.localId,
+            sessionId: scenario.sessionId,
+            title: scenario.title,
+          });
+          if (source) shareSources.put(source);
+          cursor.continue();
         };
       }
     };
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => {
+      request.result.onversionchange = () => request.result.close();
+      resolve(request.result);
+    };
   });
 }
 
@@ -126,14 +244,58 @@ function sortScenarios(scenarios: ScenarioRecord[]): ScenarioRecord[] {
 export async function listScenarios(): Promise<ScenarioRecord[]> {
   return withDatabase(async (database) => {
     return new Promise((resolve, reject) => {
-      const request = database
-        .transaction(SCENARIO_STORE_NAME, "readonly")
-        .objectStore(SCENARIO_STORE_NAME)
-        .getAll();
+      const transaction = database.transaction(
+        [SCENARIO_STORE_NAME, META_STORE_NAME],
+        "readonly",
+      );
+      const request = transaction.objectStore(SCENARIO_STORE_NAME).getAll();
+      const meta = transaction.objectStore(META_STORE_NAME);
       request.onerror = () =>
         reject(request.error ?? new Error("indexeddb_read_failed"));
-      request.onsuccess = () =>
-        resolve(sortScenarios((request.result as ScenarioRecord[]) ?? []));
+      request.onsuccess = () => {
+        const records = (request.result as ScenarioRecord[]) ?? [];
+        if (records.length === 0) {
+          resolve([]);
+          return;
+        }
+        const visible: ScenarioRecord[] = [];
+        let remaining = records.length;
+        for (const record of records) {
+          const deletedRequest = meta.get(tombstoneKey(record.localId));
+          const generationRequest = meta.get(generationKey(record.localId));
+          let settled = 0;
+          let deleted = false;
+          let generation = 0;
+          const finish = () => {
+            settled += 1;
+            if (settled !== 2) return;
+            if (!deleted && (record.localGeneration ?? 0) >= generation)
+              visible.push(record);
+            remaining -= 1;
+            if (remaining === 0) resolve(sortScenarios(visible));
+          };
+          deletedRequest.onsuccess = () => {
+            deleted = Boolean(deletedRequest.result);
+            finish();
+          };
+          generationRequest.onsuccess = () => {
+            const value = generationRequest.result as
+              { generation?: unknown } | undefined;
+            generation =
+              typeof value?.generation === "number" &&
+              Number.isInteger(value.generation)
+                ? value.generation
+                : 0;
+            finish();
+          };
+          deletedRequest.onerror = () =>
+            reject(deletedRequest.error ?? new Error("indexeddb_read_failed"));
+          generationRequest.onerror = () =>
+            reject(
+              generationRequest.error ?? new Error("indexeddb_read_failed"),
+            );
+        }
+      };
     });
   });
 }
@@ -143,14 +305,161 @@ export async function getScenario(
 ): Promise<ScenarioRecord | null> {
   return withDatabase(async (database) => {
     return new Promise((resolve, reject) => {
+      const transaction = database.transaction(
+        [SCENARIO_STORE_NAME, META_STORE_NAME],
+        "readonly",
+      );
+      const request = transaction.objectStore(SCENARIO_STORE_NAME).get(localId);
+      const deleted = transaction
+        .objectStore(META_STORE_NAME)
+        .get(tombstoneKey(localId));
+      const generationRequest = transaction
+        .objectStore(META_STORE_NAME)
+        .get(generationKey(localId));
+      let scenario: ScenarioRecord | null = null;
+      let isDeleted = false;
+      let generation = 0;
+      let settled = 0;
+      const complete = () => {
+        settled += 1;
+        if (settled === 3) {
+          resolve(
+            isDeleted ||
+              (scenario && (scenario.localGeneration ?? 0) < generation)
+              ? null
+              : scenario,
+          );
+        }
+      };
+      request.onerror = () =>
+        reject(request.error ?? new Error("indexeddb_read_failed"));
+      request.onsuccess = () => {
+        scenario = (request.result as ScenarioRecord | undefined) ?? null;
+        complete();
+      };
+      deleted.onerror = () =>
+        reject(deleted.error ?? new Error("indexeddb_read_failed"));
+      deleted.onsuccess = () => {
+        isDeleted = Boolean(deleted.result);
+        complete();
+      };
+      generationRequest.onerror = () =>
+        reject(generationRequest.error ?? new Error("indexeddb_read_failed"));
+      generationRequest.onsuccess = () => {
+        const value = generationRequest.result as
+          { generation?: unknown } | undefined;
+        generation =
+          typeof value?.generation === "number" &&
+          Number.isInteger(value.generation)
+            ? value.generation
+            : 0;
+        complete();
+      };
+    });
+  });
+}
+
+export async function listShareSources(): Promise<ShareSourceRecord[]> {
+  return withDatabase(async (database) => {
+    return new Promise((resolve, reject) => {
       const request = database
-        .transaction(SCENARIO_STORE_NAME, "readonly")
-        .objectStore(SCENARIO_STORE_NAME)
-        .get(localId);
+        .transaction(SHARE_SOURCE_STORE_NAME, "readonly")
+        .objectStore(SHARE_SOURCE_STORE_NAME)
+        .getAll();
       request.onerror = () =>
         reject(request.error ?? new Error("indexeddb_read_failed"));
       request.onsuccess = () =>
-        resolve((request.result as ScenarioRecord | undefined) ?? null);
+        resolve(
+          ((request.result as ShareSourceRecord[]) ?? []).sort((a, b) =>
+            b.lastSeenAt.localeCompare(a.lastSeenAt),
+          ),
+        );
+    });
+  });
+}
+
+export async function rememberShareSource(
+  sessionId: string,
+  title: string,
+  localId: string | null,
+): Promise<void> {
+  if (!validSessionId(sessionId)) throw new Error("invalid_share_source");
+  return withDatabase(async (database) => {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(
+        [SCENARIO_STORE_NAME, META_STORE_NAME, SHARE_SOURCE_STORE_NAME],
+        "readwrite",
+      );
+      const scenarios = transaction.objectStore(SCENARIO_STORE_NAME);
+      const meta = transaction.objectStore(META_STORE_NAME);
+      const store = transaction.objectStore(SHARE_SOURCE_STORE_NAME);
+      const existingRequest = store.get(sessionId);
+      let existing: ShareSourceRecord | undefined;
+      let localScenario: ScenarioRecord | undefined;
+      let deleted = false;
+      let generation = 0;
+      let checksRemaining = localId ? 4 : 1;
+      const write = () => {
+        checksRemaining -= 1;
+        if (checksRemaining !== 0) return;
+        const attachedLocalId =
+          localId &&
+          localScenario?.sessionId === sessionId &&
+          !deleted &&
+          (localScenario.localGeneration ?? 0) >= generation
+            ? localId
+            : null;
+        store.put({
+          sessionId,
+          title: title.slice(0, 128),
+          localId: attachedLocalId,
+          firstSeenAt: existing?.firstSeenAt ?? now(),
+          lastSeenAt: now(),
+        } satisfies ShareSourceRecord);
+      };
+      existingRequest.onsuccess = () => {
+        existing = existingRequest.result as ShareSourceRecord | undefined;
+        write();
+      };
+      existingRequest.onerror = () =>
+        reject(existingRequest.error ?? new Error("indexeddb_read_failed"));
+      if (localId) {
+        const scenarioRequest = scenarios.get(localId);
+        const deletedRequest = meta.get(tombstoneKey(localId));
+        const generationRequest = meta.get(generationKey(localId));
+        scenarioRequest.onsuccess = () => {
+          localScenario = scenarioRequest.result as ScenarioRecord | undefined;
+          write();
+        };
+        deletedRequest.onsuccess = () => {
+          deleted = Boolean(deletedRequest.result);
+          write();
+        };
+        generationRequest.onsuccess = () => {
+          const value = generationRequest.result as
+            { generation?: unknown } | undefined;
+          generation =
+            typeof value?.generation === "number" &&
+            Number.isInteger(value.generation)
+              ? value.generation
+              : 0;
+          write();
+        };
+        for (const request of [
+          scenarioRequest,
+          deletedRequest,
+          generationRequest,
+        ]) {
+          request.onerror = () =>
+            reject(request.error ?? new Error("indexeddb_read_failed"));
+        }
+      }
+      transaction.onerror = () =>
+        reject(transaction.error ?? new Error("indexeddb_write_failed"));
+      transaction.oncomplete = () => {
+        publishScenarioEvent({ type: "sources-changed", sessionId });
+        resolve();
+      };
     });
   });
 }
@@ -192,15 +501,51 @@ export async function loadActiveScenario(): Promise<ScenarioRecord | null> {
           resolve(null);
           return;
         }
-        const scenarioRequest = transaction
-          .objectStore(SCENARIO_STORE_NAME)
-          .get(localId);
+        const scenarios = transaction.objectStore(SCENARIO_STORE_NAME);
+        const meta = transaction.objectStore(META_STORE_NAME);
+        const scenarioRequest = scenarios.get(localId);
+        const deletedRequest = meta.get(tombstoneKey(localId));
+        const generationRequest = meta.get(generationKey(localId));
+        let scenario: ScenarioRecord | null = null;
+        let deleted = false;
+        let generation = 0;
+        let settled = 0;
+        const finish = () => {
+          settled += 1;
+          if (settled === 3) {
+            resolve(
+              deleted ||
+                (scenario && (scenario.localGeneration ?? 0) < generation)
+                ? null
+                : scenario,
+            );
+          }
+        };
         scenarioRequest.onerror = () =>
           reject(scenarioRequest.error ?? new Error("indexeddb_read_failed"));
-        scenarioRequest.onsuccess = () =>
-          resolve(
-            (scenarioRequest.result as ScenarioRecord | undefined) ?? null,
-          );
+        scenarioRequest.onsuccess = () => {
+          scenario =
+            (scenarioRequest.result as ScenarioRecord | undefined) ?? null;
+          finish();
+        };
+        deletedRequest.onerror = () =>
+          reject(deletedRequest.error ?? new Error("indexeddb_read_failed"));
+        deletedRequest.onsuccess = () => {
+          deleted = Boolean(deletedRequest.result);
+          finish();
+        };
+        generationRequest.onerror = () =>
+          reject(generationRequest.error ?? new Error("indexeddb_read_failed"));
+        generationRequest.onsuccess = () => {
+          const value = generationRequest.result as
+            { generation?: unknown } | undefined;
+          generation =
+            typeof value?.generation === "number" &&
+            Number.isInteger(value.generation)
+              ? value.generation
+              : 0;
+          finish();
+        };
       };
     });
   });
@@ -209,10 +554,57 @@ export async function loadActiveScenario(): Promise<ScenarioRecord | null> {
 export async function setActiveScenario(localId: string): Promise<void> {
   return withDatabase(async (database) => {
     await new Promise<void>((resolve, reject) => {
-      const transaction = database.transaction(META_STORE_NAME, "readwrite");
-      transaction
-        .objectStore(META_STORE_NAME)
-        .put({ localId }, ACTIVE_SCENARIO_KEY);
+      const transaction = database.transaction(
+        [SCENARIO_STORE_NAME, META_STORE_NAME],
+        "readwrite",
+      );
+      const meta = transaction.objectStore(META_STORE_NAME);
+      const scenarioRequest = transaction
+        .objectStore(SCENARIO_STORE_NAME)
+        .get(localId);
+      const deletedRequest = meta.get(tombstoneKey(localId));
+      const generationRequest = meta.get(generationKey(localId));
+      let scenario: ScenarioRecord | undefined;
+      let deleted = false;
+      let generation = 0;
+      let settled = 0;
+      const finish = () => {
+        settled += 1;
+        if (settled !== 3) return;
+        if (
+          !scenario ||
+          deleted ||
+          (scenario.localGeneration ?? 0) < generation
+        ) {
+          reject(new Error("scenario_removed"));
+          return;
+        }
+        meta.put({ localId }, ACTIVE_SCENARIO_KEY);
+      };
+      scenarioRequest.onsuccess = () => {
+        scenario = scenarioRequest.result as ScenarioRecord | undefined;
+        finish();
+      };
+      scenarioRequest.onerror = () =>
+        reject(scenarioRequest.error ?? new Error("indexeddb_read_failed"));
+      deletedRequest.onsuccess = () => {
+        deleted = Boolean(deletedRequest.result);
+        finish();
+      };
+      deletedRequest.onerror = () =>
+        reject(deletedRequest.error ?? new Error("indexeddb_read_failed"));
+      generationRequest.onsuccess = () => {
+        const value = generationRequest.result as
+          { generation?: unknown } | undefined;
+        generation =
+          typeof value?.generation === "number" &&
+          Number.isInteger(value.generation)
+            ? value.generation
+            : 0;
+        finish();
+      };
+      generationRequest.onerror = () =>
+        reject(generationRequest.error ?? new Error("indexeddb_read_failed"));
       transaction.onerror = () =>
         reject(transaction.error ?? new Error("indexeddb_write_failed"));
       transaction.oncomplete = () => resolve();
@@ -223,61 +615,366 @@ export async function setActiveScenario(localId: string): Promise<void> {
 export async function saveScenario(
   scenario: ScenarioRecord,
   makeActive = true,
-): Promise<void> {
+  advanceLocalGeneration = false,
+): Promise<boolean> {
   return withDatabase(async (database) => {
-    await new Promise<void>((resolve, reject) => {
-      const storeNames = makeActive
-        ? [SCENARIO_STORE_NAME, META_STORE_NAME]
-        : [SCENARIO_STORE_NAME];
-      const transaction = database.transaction(storeNames, "readwrite");
-      transaction.objectStore(SCENARIO_STORE_NAME).put(scenario);
-      if (makeActive)
-        transaction
-          .objectStore(META_STORE_NAME)
-          .put({ localId: scenario.localId }, ACTIVE_SCENARIO_KEY);
-      const allRequest = transaction.objectStore(SCENARIO_STORE_NAME).getAll();
-      allRequest.onsuccess = () => {
-        const records = sortScenarios(
-          (allRequest.result as ScenarioRecord[]) ?? [],
-        );
-        const keep = new Set(
-          records.slice(0, MAX_LOCAL_SCENARIOS).map((record) => record.localId),
-        );
-        for (const record of records.slice(MAX_LOCAL_SCENARIOS)) {
-          if (!record.dirty && !keep.has(record.localId))
-            transaction.objectStore(SCENARIO_STORE_NAME).delete(record.localId);
+    return new Promise<boolean>((resolve, reject) => {
+      const transaction = database.transaction(
+        [
+          DRAFT_STORE_NAME,
+          SCENARIO_STORE_NAME,
+          META_STORE_NAME,
+          SHARE_SOURCE_STORE_NAME,
+        ],
+        "readwrite",
+      );
+      const drafts = transaction.objectStore(DRAFT_STORE_NAME);
+      const scenarios = transaction.objectStore(SCENARIO_STORE_NAME);
+      const meta = transaction.objectStore(META_STORE_NAME);
+      const shareSources = transaction.objectStore(SHARE_SOURCE_STORE_NAME);
+      const tombstoneRequest = meta.get(tombstoneKey(scenario.localId));
+      const generationRequest = meta.get(generationKey(scenario.localId));
+      const activeRequest = makeActive ? null : meta.get(ACTIVE_SCENARIO_KEY);
+      let tombstone: unknown;
+      let storedGeneration = 0;
+      let activeLocalId: string | null = makeActive ? scenario.localId : null;
+      let checksRemaining = activeRequest ? 3 : 2;
+      let saved = false;
+      const prunedLocalIds: string[] = [];
+
+      const prepareSave = () => {
+        checksRemaining -= 1;
+        if (checksRemaining !== 0) return;
+        const localGeneration = scenario.localGeneration ?? 0;
+        if (tombstone || localGeneration < storedGeneration) return;
+        const generation =
+          Math.max(localGeneration, storedGeneration) +
+          (advanceLocalGeneration ? 1 : 0);
+        const savedScenario = { ...scenario, localGeneration: generation };
+        scenarios.put(savedScenario);
+        meta.put({ generation }, generationKey(scenario.localId));
+        if (makeActive)
+          meta.put({ localId: scenario.localId }, ACTIVE_SCENARIO_KEY);
+        saved = true;
+
+        const source = sourceRecord(savedScenario);
+        if (source) {
+          const sourceRequest = shareSources.get(source.sessionId);
+          sourceRequest.onsuccess = () => {
+            const existing = sourceRequest.result as
+              ShareSourceRecord | undefined;
+            if (
+              existing &&
+              (existing.localId !== source.localId ||
+                existing.title !== source.title)
+            ) {
+              shareSources.put({
+                ...existing,
+                title: source.title,
+                localId: source.localId,
+                lastSeenAt: now(),
+              });
+            }
+          };
         }
+
+        const allRequest = scenarios.getAll();
+        allRequest.onsuccess = () => {
+          const records = sortScenarios(
+            (allRequest.result as ScenarioRecord[]) ?? [],
+          );
+          const keep = new Set(
+            records
+              .slice(0, MAX_LOCAL_SCENARIOS)
+              .map((record) => record.localId),
+          );
+          if (activeLocalId) keep.add(activeLocalId);
+          for (const record of records) {
+            if (record.dirty || keep.has(record.localId)) continue;
+            scenarios.delete(record.localId);
+            if (record.localId === LEGACY_SCENARIO_ID)
+              drafts.delete(LEGACY_ACTIVE_KEY);
+            prunedLocalIds.push(record.localId);
+            const nextGeneration = (record.localGeneration ?? 0) + 1;
+            meta.put(
+              { generation: nextGeneration },
+              generationKey(record.localId),
+            );
+            meta.put(
+              {
+                generation: nextGeneration,
+                deletionId: newScenarioId(),
+                deletedAt: now(),
+                reason: "pruned",
+              },
+              tombstoneKey(record.localId),
+            );
+            if (validSessionId(record.sessionId)) {
+              const priorSource = shareSources.get(record.sessionId);
+              priorSource.onsuccess = () => {
+                const existing = priorSource.result as
+                  ShareSourceRecord | undefined;
+                if (existing)
+                  shareSources.put({
+                    ...existing,
+                    localId: null,
+                    lastSeenAt: now(),
+                  });
+              };
+            }
+          }
+        };
+        allRequest.onerror = () =>
+          reject(allRequest.error ?? new Error("indexeddb_read_failed"));
       };
-      allRequest.onerror = () =>
-        reject(allRequest.error ?? new Error("indexeddb_read_failed"));
+
+      tombstoneRequest.onsuccess = () => {
+        tombstone = tombstoneRequest.result;
+        prepareSave();
+      };
+      tombstoneRequest.onerror = () =>
+        reject(tombstoneRequest.error ?? new Error("indexeddb_read_failed"));
+      generationRequest.onsuccess = () => {
+        const value = generationRequest.result as
+          { generation?: unknown } | undefined;
+        storedGeneration =
+          typeof value?.generation === "number" &&
+          Number.isInteger(value.generation)
+            ? value.generation
+            : 0;
+        prepareSave();
+      };
+      generationRequest.onerror = () =>
+        reject(generationRequest.error ?? new Error("indexeddb_read_failed"));
+      activeRequest?.addEventListener("success", () => {
+        const active = activeRequest.result as
+          { localId?: unknown } | undefined;
+        activeLocalId =
+          typeof active?.localId === "string" ? active.localId : null;
+        prepareSave();
+      });
+      activeRequest?.addEventListener("error", () => {
+        reject(activeRequest.error ?? new Error("indexeddb_read_failed"));
+      });
       transaction.onerror = () =>
         reject(transaction.error ?? new Error("indexeddb_write_failed"));
-      transaction.oncomplete = () => resolve();
+      transaction.oncomplete = () => {
+        if (prunedLocalIds.length > 0)
+          publishScenarioEvent({ type: "removed", localIds: prunedLocalIds });
+        resolve(saved);
+      };
     });
   });
 }
 
-export async function deleteScenario(localId: string): Promise<void> {
+export async function deleteScenario(
+  localId: string,
+): Promise<DeletedScenario | null> {
   return withDatabase(async (database) => {
-    await new Promise<void>((resolve, reject) => {
+    return new Promise<DeletedScenario | null>((resolve, reject) => {
       const transaction = database.transaction(
-        [SCENARIO_STORE_NAME, META_STORE_NAME],
+        [
+          DRAFT_STORE_NAME,
+          SCENARIO_STORE_NAME,
+          META_STORE_NAME,
+          SHARE_SOURCE_STORE_NAME,
+        ],
         "readwrite",
       );
-      transaction.objectStore(SCENARIO_STORE_NAME).delete(localId);
-      const activeRequest = transaction
-        .objectStore(META_STORE_NAME)
-        .get(ACTIVE_SCENARIO_KEY);
-      activeRequest.onsuccess = () => {
-        const active = activeRequest.result as { localId?: string } | undefined;
-        if (active?.localId === localId)
-          transaction.objectStore(META_STORE_NAME).delete(ACTIVE_SCENARIO_KEY);
+      const drafts = transaction.objectStore(DRAFT_STORE_NAME);
+      const scenarios = transaction.objectStore(SCENARIO_STORE_NAME);
+      const meta = transaction.objectStore(META_STORE_NAME);
+      const shareSources = transaction.objectStore(SHARE_SOURCE_STORE_NAME);
+      const scenarioRequest = scenarios.get(localId);
+      const generationRequest = meta.get(generationKey(localId));
+      const tombstoneRequest = meta.get(tombstoneKey(localId));
+      const activeRequest = meta.get(ACTIVE_SCENARIO_KEY);
+      const shareSourceRequest = shareSources.getAll();
+      let scenario: ScenarioRecord | undefined;
+      let storedGeneration = 0;
+      let isDeleted = false;
+      let activeLocalId: string | null = null;
+      let knownShareSources: ShareSourceRecord[] = [];
+      let settled = 0;
+      let deletion: DeletedScenario | null = null;
+      const finish = () => {
+        settled += 1;
+        if (settled !== 5) return;
+        if (!scenario || isDeleted) return;
+        const generation =
+          Math.max(scenario.localGeneration ?? 0, storedGeneration) + 1;
+        const deletionId = newScenarioId();
+        const deletedAt = now();
+        scenarios.delete(localId);
+        if (localId === LEGACY_SCENARIO_ID) drafts.delete(LEGACY_ACTIVE_KEY);
+        meta.put({ generation }, generationKey(localId));
+        meta.put(
+          { generation, deletionId, deletedAt, reason: "user" },
+          tombstoneKey(localId),
+        );
+        if (activeLocalId === localId) meta.delete(ACTIVE_SCENARIO_KEY);
+        const associated = knownShareSources.filter(
+          (source) => source.localId === localId,
+        );
+        for (const source of associated) {
+          shareSources.put({ ...source, localId: null, lastSeenAt: now() });
+        }
+        deletion = {
+          scenario,
+          generation,
+          deletionId,
+          deletedAt,
+          shareSources: associated,
+        };
       };
-      activeRequest.onerror = () =>
-        reject(activeRequest.error ?? new Error("indexeddb_read_failed"));
+      scenarioRequest.onsuccess = () => {
+        scenario = scenarioRequest.result as ScenarioRecord | undefined;
+        finish();
+      };
+      generationRequest.onsuccess = () => {
+        const value = generationRequest.result as
+          { generation?: unknown } | undefined;
+        storedGeneration =
+          typeof value?.generation === "number" &&
+          Number.isInteger(value.generation)
+            ? value.generation
+            : 0;
+        finish();
+      };
+      tombstoneRequest.onsuccess = () => {
+        isDeleted = Boolean(tombstoneRequest.result);
+        finish();
+      };
+      activeRequest.onsuccess = () => {
+        const value = activeRequest.result as { localId?: unknown } | undefined;
+        activeLocalId =
+          typeof value?.localId === "string" ? value.localId : null;
+        finish();
+      };
+      shareSourceRequest.onsuccess = () => {
+        knownShareSources =
+          (shareSourceRequest.result as ShareSourceRecord[]) ?? [];
+        finish();
+      };
+      for (const request of [
+        scenarioRequest,
+        generationRequest,
+        tombstoneRequest,
+        activeRequest,
+        shareSourceRequest,
+      ]) {
+        request.onerror = () =>
+          reject(request.error ?? new Error("indexeddb_read_failed"));
+      }
       transaction.onerror = () =>
         reject(transaction.error ?? new Error("indexeddb_delete_failed"));
-      transaction.oncomplete = () => resolve();
+      transaction.oncomplete = () => {
+        if (deletion)
+          publishScenarioEvent({ type: "removed", localIds: [localId] });
+        resolve(deletion);
+      };
+    });
+  });
+}
+
+export async function restoreDeletedScenario(
+  deletion: DeletedScenario,
+): Promise<ScenarioRecord | null> {
+  return withDatabase(async (database) => {
+    return new Promise<ScenarioRecord | null>((resolve, reject) => {
+      const transaction = database.transaction(
+        [SCENARIO_STORE_NAME, META_STORE_NAME, SHARE_SOURCE_STORE_NAME],
+        "readwrite",
+      );
+      const scenarios = transaction.objectStore(SCENARIO_STORE_NAME);
+      const meta = transaction.objectStore(META_STORE_NAME);
+      const shareSources = transaction.objectStore(SHARE_SOURCE_STORE_NAME);
+      const tombstoneRequest = meta.get(
+        tombstoneKey(deletion.scenario.localId),
+      );
+      const generationRequest = meta.get(
+        generationKey(deletion.scenario.localId),
+      );
+      const existingScenarioRequest = scenarios.get(deletion.scenario.localId);
+      let tombstone: { deletionId?: unknown; generation?: unknown } | undefined;
+      let storedGeneration = 0;
+      let settled = 0;
+      let restored: ScenarioRecord | null = null;
+      const finish = () => {
+        settled += 1;
+        if (settled !== 3) return;
+        if (
+          !tombstone ||
+          tombstone.deletionId !== deletion.deletionId ||
+          tombstone.generation !== deletion.generation ||
+          storedGeneration !== deletion.generation ||
+          existingScenarioRequest.result ||
+          Date.now() - Date.parse(deletion.deletedAt) > 10_000
+        )
+          return;
+        const generation = storedGeneration + 1;
+        const restoredScenario: ScenarioRecord = {
+          ...deletion.scenario,
+          localGeneration: generation,
+          lastOpenedAt: now(),
+          savedAt: now(),
+        };
+        restored = restoredScenario;
+        scenarios.put(restoredScenario);
+        meta.put({ generation }, generationKey(restoredScenario.localId));
+        meta.delete(tombstoneKey(restoredScenario.localId));
+        for (const source of deletion.shareSources) {
+          const sourceRequest = shareSources.get(source.sessionId);
+          sourceRequest.onsuccess = () => {
+            const existing = sourceRequest.result as
+              ShareSourceRecord | undefined;
+            // Do not resurrect a manager handle the user deliberately forgot
+            // during the Undo window or steal one reassociated in another tab.
+            if (
+              !existing ||
+              (existing.localId !== null &&
+                existing.localId !== deletion.scenario.localId)
+            )
+              return;
+            shareSources.put({
+              ...existing,
+              title: restoredScenario.title,
+              localId: restoredScenario.localId,
+              lastSeenAt: now(),
+            });
+          };
+        }
+      };
+      tombstoneRequest.onsuccess = () => {
+        tombstone = tombstoneRequest.result as typeof tombstone;
+        finish();
+      };
+      generationRequest.onsuccess = () => {
+        const value = generationRequest.result as
+          { generation?: unknown } | undefined;
+        storedGeneration =
+          typeof value?.generation === "number" &&
+          Number.isInteger(value.generation)
+            ? value.generation
+            : 0;
+        finish();
+      };
+      existingScenarioRequest.onsuccess = () => finish();
+      existingScenarioRequest.onerror = () =>
+        reject(
+          existingScenarioRequest.error ?? new Error("indexeddb_read_failed"),
+        );
+      tombstoneRequest.onerror = () =>
+        reject(tombstoneRequest.error ?? new Error("indexeddb_read_failed"));
+      generationRequest.onerror = () =>
+        reject(generationRequest.error ?? new Error("indexeddb_read_failed"));
+      transaction.onerror = () =>
+        reject(transaction.error ?? new Error("indexeddb_write_failed"));
+      transaction.oncomplete = () => {
+        if (restored)
+          publishScenarioEvent({ type: "restored", localId: restored.localId });
+        resolve(restored);
+      };
     });
   });
 }
@@ -286,10 +983,17 @@ export async function clearScenarioStore(): Promise<void> {
   return withDatabase(async (database) => {
     await new Promise<void>((resolve, reject) => {
       const transaction = database.transaction(
-        [SCENARIO_STORE_NAME, META_STORE_NAME],
+        [
+          DRAFT_STORE_NAME,
+          SCENARIO_STORE_NAME,
+          SHARE_SOURCE_STORE_NAME,
+          META_STORE_NAME,
+        ],
         "readwrite",
       );
+      transaction.objectStore(DRAFT_STORE_NAME).clear();
       transaction.objectStore(SCENARIO_STORE_NAME).clear();
+      transaction.objectStore(SHARE_SOURCE_STORE_NAME).clear();
       transaction.objectStore(META_STORE_NAME).clear();
       transaction.onerror = () =>
         reject(transaction.error ?? new Error("indexeddb_delete_failed"));

@@ -42,7 +42,11 @@ function sessionBody(
 
 async function mockSessionApi(
   page: Page,
-  options: { shareNotice?: boolean } = {},
+  options: {
+    shareNotice?: boolean;
+    shareActive?: boolean;
+    shareRedemptionDelayMs?: number;
+  } = {},
 ) {
   let nextSession = 0;
   const sessions = new Map<
@@ -52,8 +56,13 @@ async function mockSessionApi(
   let forkState = emptyState();
   const forkSessionId = "e2e-fork-session-abcdefgh";
   const shareId = "e2e-share-id-abcdefghijkl";
-  let shareActive = false;
-  let shareNoticeActive = options.shareNotice === true;
+  const shareIdsBySession = new Map<string, string[]>(
+    options.shareActive ? [[SESSION_ID, [shareId]]] : [],
+  );
+  const shareNoticeBySession = new Set<string>(
+    options.shareNotice ? [SESSION_ID] : [],
+  );
+  let createdShareCount = 0;
   let deepJobPolls = 0;
   const deepJobId = "e2e-deep-job-abcdefghijkl";
 
@@ -122,6 +131,11 @@ async function mockSessionApi(
   });
 
   await page.route("**/api/v1/shares/redeem", async (route) => {
+    if (options.shareRedemptionDelayMs) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, options.shareRedemptionDelayMs),
+      );
+    }
     forkState = {
       ...emptyState(),
       metadata: {
@@ -174,19 +188,15 @@ async function mockSessionApi(
         status: 200,
         contentType: "application/json",
         body: JSON.stringify({
-          shares: shareActive
-            ? [
-                {
-                  shareId,
-                  sourceRevision: session.revision,
-                  createdAt: "2026-09-23T00:00:00.000Z",
-                  expiresAt: null,
-                  useCount: 0,
-                  lastUsedAt: null,
-                },
-              ]
-            : [],
-          notices: shareNoticeActive
+          shares: (shareIdsBySession.get(routeSessionId) ?? []).map((id) => ({
+            shareId: id,
+            sourceRevision: session.revision,
+            createdAt: "2026-09-23T00:00:00.000Z",
+            expiresAt: null,
+            useCount: 0,
+            lastUsedAt: null,
+          })),
+          notices: shareNoticeBySession.has(routeSessionId)
             ? [
                 {
                   shareId: "e2e-evicted-share-abcdefghijkl",
@@ -202,16 +212,21 @@ async function mockSessionApi(
       return;
     }
     if (url.pathname.endsWith("/share") && request.method() === "POST") {
-      shareActive = true;
+      createdShareCount += 1;
+      const newShareId = `e2e-share-${createdShareCount}-abcdefghijkl`;
+      shareIdsBySession.set(routeSessionId, [
+        ...(shareIdsBySession.get(routeSessionId) ?? []),
+        newShareId,
+      ]);
       await route.fulfill({
         status: 201,
         contentType: "application/json",
         body: JSON.stringify({
           share: {
-            shareId,
+            shareId: newShareId,
             sourceSessionId: routeSessionId,
             sourceRevision: session.revision,
-            token: "share-token-abcdefghijklmnopqrstuvwxyz0123456789",
+            token: `share-token-${createdShareCount}-abcdefghijklmnopqrstuvwxyz0123456789`,
             expiresAt: null,
             lifetime: "until_revoked",
           },
@@ -223,7 +238,7 @@ async function mockSessionApi(
       url.pathname.endsWith("/share-notices/e2e-evicted-share-abcdefghijkl") &&
       request.method() === "DELETE"
     ) {
-      shareNoticeActive = false;
+      shareNoticeBySession.delete(routeSessionId);
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -231,11 +246,14 @@ async function mockSessionApi(
       });
       return;
     }
-    if (
-      url.pathname.endsWith(`/share/${shareId}`) &&
-      request.method() === "DELETE"
-    ) {
-      shareActive = false;
+    const revokeMatch = url.pathname.match(/\/share\/([^/]+)$/);
+    if (revokeMatch && request.method() === "DELETE") {
+      shareIdsBySession.set(
+        routeSessionId,
+        (shareIdsBySession.get(routeSessionId) ?? []).filter(
+          (id) => id !== revokeMatch[1],
+        ),
+      );
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -430,6 +448,40 @@ async function clearDraft(page: Page) {
   });
 }
 
+async function readScenarioSnapshot(page: Page, localId: string) {
+  return page.evaluate(async (id) => {
+    const request = indexedDB.open("quackle-web-drafts");
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const transaction = database.transaction(["scenarios", "meta"], "readonly");
+    const scenarioRequest = transaction.objectStore("scenarios").get(id);
+    const generationRequest = transaction
+      .objectStore("meta")
+      .get(`scenario-generation:${id}`);
+    const [scenario, generation] = await Promise.all([
+      new Promise<Record<string, unknown> | null>((resolve, reject) => {
+        scenarioRequest.onsuccess = () =>
+          resolve(
+            (scenarioRequest.result as Record<string, unknown> | undefined) ??
+              null,
+          );
+        scenarioRequest.onerror = () => reject(scenarioRequest.error);
+      }),
+      new Promise<{ generation?: number } | undefined>((resolve, reject) => {
+        generationRequest.onsuccess = () =>
+          resolve(
+            generationRequest.result as { generation?: number } | undefined,
+          );
+        generationRequest.onerror = () => reject(generationRequest.error);
+      }),
+    ]);
+    database.close();
+    return { scenario, generation: generation?.generation ?? 0 };
+  }, localId);
+}
+
 test("starts without fixture candidates, offers a random New game, and opens About", async ({
   page,
 }) => {
@@ -461,7 +513,7 @@ test("starts without fixture candidates, offers a random New game, and opens Abo
 
   await page.getByRole("button", { name: "Open recent scenarios" }).click();
   await page
-    .getByRole("dialog", { name: "Recent scenarios" })
+    .getByRole("dialog", { name: "Your workspace" })
     .getByRole("button", { name: "Blank position" })
     .click();
   await expect(page.getByText("Session ready")).toBeVisible();
@@ -505,34 +557,472 @@ test("creates an independent snapshot share link", async ({ page }) => {
   await expect(page.getByText("Session ready")).toBeVisible();
   await page.getByRole("button", { name: "Open settings" }).click();
   await page.getByRole("button", { name: "Share scenario" }).click();
+  const created = page.getByRole("dialog", { name: "Share scenario" });
+  const url = created.getByRole("textbox", { name: "One-time share URL" });
+  await expect(url).toHaveValue(
+    /#\/share\/e2e-session-abcdefghijkl\/share-token-/,
+  );
+  await expect(created.getByText(/shown only now/)).toBeVisible();
+  const sourceHandles = await page.evaluate(async () => {
+    const request = indexedDB.open("quackle-web-drafts");
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const read = database
+      .transaction("shareSources", "readonly")
+      .objectStore("shareSources")
+      .getAll();
+    const result = await new Promise<unknown[]>((resolve, reject) => {
+      read.onsuccess = () => resolve(read.result as unknown[]);
+      read.onerror = () => reject(read.error);
+    });
+    database.close();
+    return result;
+  });
+  expect(JSON.stringify(sourceHandles)).not.toContain("share-token-");
+  await created.getByRole("button", { name: "Done" }).click();
+  await page.getByRole("button", { name: "Close settings" }).click();
+
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  const manager = page.getByRole("dialog", { name: "Your workspace" });
+  await manager.getByRole("tab", { name: "Share links" }).click();
+  const source = manager
+    .locator(".share-source-card")
+    .filter({ hasText: "New game" })
+    .first();
+  await expect(source).toBeVisible();
+  await source.getByRole("button", { name: /Check|Refresh/ }).click();
+  await expect(source.getByText("1 active link")).toBeVisible();
+  await expect(source).not.toContainText("share-token-");
+  await source.getByRole("button", { name: "Revoke" }).click();
+  const confirm = page.getByRole("alertdialog", { name: "Revoke this link?" });
+  await confirm.getByRole("button", { name: "Revoke link" }).click();
+  await expect(source.getByText("0 active links")).toBeVisible();
   await expect(
-    page.getByText(
-      /Permanent share link (copied · recipients get independent forks|created · clipboard unavailable)/,
-    ),
+    source.getByRole("button", { name: "Create link" }),
   ).toBeVisible();
-  await expect(page.getByText(/Permanent · 0 forks/)).toBeVisible();
-  await page.getByRole("button", { name: "Revoke" }).click();
+  await source.getByRole("button", { name: "Create link" }).click();
+  const replacement = page.getByRole("dialog", { name: "Share scenario" });
   await expect(
-    page.getByText("Share link revoked · existing forks remain independent"),
-  ).toBeVisible();
+    replacement.getByRole("textbox", { name: "One-time share URL" }),
+  ).toHaveValue(/#\/share\/e2e-session-abcdefghijkl\/share-token-/);
+  await replacement.getByRole("button", { name: "Done" }).click();
+  await expect(source.getByText("1 active link")).toBeVisible();
 });
 
 test("shows and dismisses automatic share-link eviction notices", async ({
   page,
 }) => {
   await clearDraft(page);
-  await mockSessionApi(page, { shareNotice: true });
+  await mockSessionApi(page, { shareNotice: true, shareActive: true });
   await page.goto("/");
 
   await expect(page.getByText("Session ready")).toBeVisible();
   await page.getByRole("button", { name: "Open settings" }).click();
+  await page.getByRole("button", { name: "Share scenario" }).click();
+  await page
+    .getByRole("dialog", { name: "Share scenario" })
+    .getByRole("button", { name: "Done" })
+    .click();
+  await page.getByRole("button", { name: "Close settings" }).click();
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  const manager = page.getByRole("dialog", { name: "Your workspace" });
+  await manager.getByRole("tab", { name: "Share links" }).click();
+  const source = manager
+    .locator(".share-source-card")
+    .filter({ hasText: "New game" })
+    .first();
+  await source.getByRole("button", { name: /Check|Refresh/ }).click();
+  await expect(source.getByText("Link removed automatically")).toBeVisible();
+  await source.getByRole("button", { name: "Dismiss" }).click();
+  await expect(source.getByText("Link removed automatically")).toHaveCount(0);
+});
+
+test("removing a shared scenario preserves its link for management", async ({
+  page,
+}) => {
+  await clearDraft(page);
+  await mockSessionApi(page);
+  await page.goto("/");
+  await expect(page.getByText("Session ready")).toBeVisible();
+
+  await page.getByRole("button", { name: "Open settings" }).click();
+  await page.getByRole("button", { name: "Share scenario" }).click();
+  const created = page.getByRole("dialog", { name: "Share scenario" });
   await expect(
-    page.getByText("Share link removed automatically"),
+    created.getByRole("textbox", { name: "One-time share URL" }),
+  ).toHaveValue(/#\/share\/e2e-session-abcdefghijkl\/share-token-/);
+  await created.getByRole("button", { name: "Done" }).click();
+  await page.getByRole("button", { name: "Close settings" }).click();
+
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  const scenarios = page.getByRole("dialog", { name: "Your workspace" });
+  await scenarios.getByRole("button", { name: "Blank position" }).click();
+  await expect(page.getByText("Session ready")).toBeVisible();
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  const list = page.getByRole("dialog", { name: "Your workspace" });
+  const original = list
+    .locator(".scenario-item")
+    .filter({ hasText: "New game" })
+    .first();
+  await original
+    .getByRole("button", { name: /Remove scenario .* from this browser/ })
+    .click();
+  const remove = page.getByRole("alertdialog", {
+    name: "Remove from this browser?",
+  });
+  await expect(remove).toContainText(
+    "Share links, server-side snapshots, and existing recipient forks are not revoked or deleted",
+  );
+  await remove
+    .getByRole("button", { name: "Remove from this browser" })
+    .click();
+  await expect(list.getByRole("tab", { name: "Scenarios" })).toBeVisible();
+  await expect(
+    list.locator(".scenario-item").filter({ hasText: "New game" }),
+  ).toHaveCount(0);
+
+  await list.getByRole("tab", { name: "Share links" }).click();
+  const source = list
+    .locator(".share-source-card")
+    .filter({ hasText: "Source scenario removed from this browser" })
+    .first();
+  await source.getByRole("button", { name: /Check|Refresh/ }).click();
+  await expect(source.getByText("1 active link")).toBeVisible();
+  await expect(source.getByRole("button", { name: "Revoke" })).toBeVisible();
+  await source.getByRole("button", { name: "Create another link" }).click();
+  const replacement = page.getByRole("dialog", { name: "Share scenario" });
+  await expect(
+    replacement.getByRole("textbox", { name: "One-time share URL" }),
+  ).toHaveValue(/#\/share\/e2e-session-abcdefghijkl\/share-token-/);
+  await replacement.getByRole("button", { name: "Done" }).click();
+  await expect(source.getByText("2 active links")).toBeVisible();
+});
+
+test("removing the active last scenario opens a new game and Undo restores the saved copy", async ({
+  page,
+}) => {
+  await clearDraft(page);
+  await mockSessionApi(page);
+  await page.goto("/");
+  await expect(page.getByText("Session ready")).toBeVisible();
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  const scenarios = page.getByRole("dialog", { name: "Your workspace" });
+  const current = scenarios
+    .locator(".scenario-item")
+    .filter({ hasText: "New game" })
+    .first();
+  await current
+    .getByRole("button", { name: /Remove scenario .* from this browser/ })
+    .click();
+  const remove = page.getByRole("alertdialog", {
+    name: "Remove from this browser?",
+  });
+  await expect(remove).toContainText("This is the current scenario");
+  await remove
+    .getByRole("button", { name: "Remove from this browser" })
+    .click();
+
+  await expect(page.getByRole("button", { name: "Undo" })).toBeVisible();
+  await expect(
+    page.getByText(/Removed .* from this browser\. Shares are unchanged\./),
   ).toBeVisible();
-  await page.getByRole("button", { name: "Dismiss" }).click();
-  await expect(page.getByText("Share link removed automatically")).toHaveCount(
+  await page.getByRole("button", { name: "Undo" }).click();
+  await expect(page.getByText(/Restored .* to this browser/)).toBeVisible();
+  await expect(
+    scenarios.locator(".scenario-item").filter({ hasText: "New game" }),
+  ).toHaveCount(2);
+  await expect(page.locator(".scenario-item.active")).toContainText("New game");
+});
+
+test("removing an active scenario in another tab preserves this tab's draft until copied", async ({
+  page,
+}) => {
+  await clearDraft(page);
+  await mockSessionApi(page);
+  await page.goto("/");
+  await expect(page.getByText("Session ready")).toBeVisible();
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  const initialManager = page.getByRole("dialog", { name: "Your workspace" });
+  const originalLocalId = await initialManager
+    .locator(".scenario-item")
+    .first()
+    .getAttribute("data-local-scenario-id");
+
+  const otherTab = await page.context().newPage();
+  await mockSessionApi(otherTab);
+  await otherTab.goto("/");
+  await expect(
+    otherTab.getByText(
+      /Session ready|Recovered local draft|Session changed · local copy preserved/,
+    ),
+  ).toBeVisible();
+  await otherTab.getByRole("button", { name: "Open recent scenarios" }).click();
+  const otherManager = otherTab.getByRole("dialog", { name: "Your workspace" });
+  await otherManager
+    .locator(".scenario-item")
+    .first()
+    .getByRole("button", { name: /Remove scenario .* from this browser/ })
+    .click();
+  await otherTab
+    .getByRole("alertdialog", { name: "Remove from this browser?" })
+    .getByRole("button", { name: "Remove from this browser" })
+    .click();
+
+  await expect(
+    initialManager.getByText(/removed in another tab/),
+  ).toBeVisible();
+  await initialManager.getByRole("button", { name: "Save a copy" }).click();
+  await expect(page.getByText("Session ready")).toBeVisible();
+  await expect(
+    initialManager.locator(".scenario-item-main strong", {
+      hasText: /recovered copy/,
+    }),
+  ).toBeVisible();
+  await expect(
+    initialManager.locator(`[data-local-scenario-id="${originalLocalId}"]`),
+  ).toHaveCount(0);
+  await otherTab.close();
+});
+
+test("a stale tab preserves edits instead of overwriting a scenario generation changed in another tab", async ({
+  page,
+}) => {
+  await clearDraft(page);
+  await mockSessionApi(page);
+  await page.goto("/");
+  await expect(page.getByText("Session ready")).toBeVisible();
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  const firstManager = page.getByRole("dialog", { name: "Your workspace" });
+  const activeRow = firstManager.locator(".scenario-item.active").first();
+  const activeLocalId = await activeRow.getAttribute("data-local-scenario-id");
+  expect(activeLocalId).toBeTruthy();
+  await expect
+    .poll(async () =>
+      page.evaluate(async (localId) => {
+        const request = indexedDB.open("quackle-web-drafts");
+        const database = await new Promise<IDBDatabase>((resolve, reject) => {
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+        const get = database
+          .transaction("scenarios", "readonly")
+          .objectStore("scenarios")
+          .get(localId);
+        const scenario = await new Promise<Record<string, unknown> | undefined>(
+          (resolve, reject) => {
+            get.onsuccess = () =>
+              resolve(get.result as Record<string, unknown> | undefined);
+            get.onerror = () => reject(get.error);
+          },
+        );
+        database.close();
+        return scenario;
+      }, activeLocalId),
+    )
+    .toMatchObject({ dirty: false, sessionId: SESSION_ID });
+  await page.getByRole("button", { name: "Close scenarios" }).click();
+
+  const otherTab = await page.context().newPage();
+  await mockSessionApi(otherTab);
+  await otherTab.goto("/");
+  await expect(
+    otherTab.getByText(
+      /Session ready|Recovered local draft|Session changed · local copy preserved/,
+    ),
+  ).toBeVisible();
+  await otherTab.getByRole("button", { name: "Open recent scenarios" }).click();
+  const otherManager = otherTab.getByRole("dialog", { name: "Your workspace" });
+  await expect(
+    otherManager.locator(`[data-local-scenario-id="${activeLocalId}"]`),
+  ).toHaveClass(/active/);
+  await otherManager.getByRole("button", { name: "Blank position" }).click();
+  await expect(otherTab.locator(".rack .rack-empty")).toBeVisible();
+
+  const advancedScenario = await readScenarioSnapshot(page, activeLocalId!);
+  expect(advancedScenario.scenario).toBeTruthy();
+  expect(advancedScenario.scenario?.localGeneration).toBe(
+    advancedScenario.generation,
+  );
+  expect(advancedScenario.generation).toBeGreaterThan(0);
+  await expect(page.getByRole("button", { name: "Save a copy" })).toHaveCount(
     0,
   );
+
+  await enterRack(page, "B");
+  await expect(
+    page.getByText(/changed or was removed in another tab/),
+  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "Save a copy" })).toBeVisible();
+  await expect(page.locator(".rack .rack-tile")).toHaveCount(1);
+  await page.getByRole("button", { name: "Save a copy" }).click();
+  await expect(page.getByText("Session ready")).toBeVisible();
+  await expect(page.locator(".rack .rack-tile")).toHaveCount(1);
+  await otherTab.close();
+});
+
+test("removing an active scenario from a stale tab cannot overwrite a newer cross-tab draft", async ({
+  page,
+}) => {
+  await clearDraft(page);
+  await mockSessionApi(page);
+  await page.goto("/");
+  await expect(page.getByText("Session ready")).toBeVisible();
+
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  const firstManager = page.getByRole("dialog", { name: "Your workspace" });
+  const activeRow = firstManager.locator(".scenario-item.active").first();
+  const activeLocalId = await activeRow.getAttribute("data-local-scenario-id");
+  expect(activeLocalId).toBeTruthy();
+  await expect
+    .poll(
+      async () => (await readScenarioSnapshot(page, activeLocalId!)).scenario,
+    )
+    .toMatchObject({ dirty: false, sessionId: SESSION_ID });
+  await page.getByRole("button", { name: "Close scenarios" }).click();
+
+  const otherTab = await page.context().newPage();
+  await mockSessionApi(otherTab);
+  await otherTab.goto("/");
+  await expect(
+    otherTab.getByText(
+      /Session ready|Recovered local draft|Session changed · local copy preserved/,
+    ),
+  ).toBeVisible();
+  await enterRack(otherTab, "C");
+  await otherTab.getByRole("button", { name: "Open recent scenarios" }).click();
+  const otherManager = otherTab.getByRole("dialog", { name: "Your workspace" });
+  await otherManager.getByRole("button", { name: "Blank position" }).click();
+  await expect(otherTab.locator(".rack .rack-empty")).toBeVisible();
+
+  await expect
+    .poll(async () => readScenarioSnapshot(page, activeLocalId!))
+    .toMatchObject({
+      scenario: { state: { position: { rack: "C" } } },
+    });
+  expect(
+    (await readScenarioSnapshot(page, activeLocalId!)).generation,
+  ).toBeGreaterThan(0);
+
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  const manager = page.getByRole("dialog", { name: "Your workspace" });
+  const staleRow = manager.locator(
+    `[data-local-scenario-id="${activeLocalId}"]`,
+  );
+  await staleRow
+    .getByRole("button", { name: /Remove scenario .* from this browser/ })
+    .click();
+  const confirmation = page.getByRole("alertdialog", {
+    name: "Remove from this browser?",
+  });
+  await confirmation
+    .getByRole("button", { name: "Remove from this browser" })
+    .click();
+
+  await expect(
+    page.getByRole("alertdialog", { name: "Remove from this browser?" }),
+  ).toHaveCount(0);
+  await expect(
+    manager.locator(`[data-local-scenario-id="${activeLocalId}"]`),
+  ).toBeVisible();
+  await expect(page.locator(".rack .rack-tile")).toContainText("C");
+  await expect
+    .poll(async () => readScenarioSnapshot(page, activeLocalId!))
+    .toMatchObject({
+      scenario: { state: { position: { rack: "C" } } },
+    });
+  await otherTab.close();
+});
+
+test("the version-two scenario migration retains source handles for existing share links", async ({
+  page,
+}) => {
+  await mockSessionApi(page, { shareActive: true });
+  await page.goto("/");
+  await expect(page.getByText("Session ready")).toBeVisible();
+  await page.waitForTimeout(250);
+
+  await page.evaluate(async () => {
+    const databaseName = "quackle-web-drafts";
+    await new Promise<void>((resolve, reject) => {
+      const request = indexedDB.deleteDatabase(databaseName);
+      request.onerror = () => reject(request.error);
+      request.onblocked = () =>
+        reject(new Error("scenario database remained open"));
+      request.onsuccess = () => resolve();
+    });
+    await new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open(databaseName, 2);
+      request.onupgradeneeded = () => {
+        const database = request.result;
+        database.createObjectStore("drafts");
+        const scenarios = database.createObjectStore("scenarios", {
+          keyPath: "localId",
+        });
+        scenarios.createIndex("sessionId", "sessionId", { unique: false });
+        scenarios.createIndex("lastOpenedAt", "lastOpenedAt", {
+          unique: false,
+        });
+        database.createObjectStore("meta");
+      };
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction(
+          ["scenarios", "meta"],
+          "readwrite",
+        );
+        transaction.objectStore("scenarios").put({
+          schemaVersion: 1,
+          localId: "legacy-shared-scenario",
+          sessionId: "e2e-session-abcdefghijkl",
+          kind: "imported",
+          title: "Legacy share owner",
+          state: {
+            position: {
+              board: { id: "classic15", cells: [] },
+              rack: "ADE",
+              scores: { onTurn: 0, opponent: 0 },
+              turn: { number: 1, scorelessTurns: 0 },
+              unseen: { mode: "derive" },
+            },
+            history: [],
+            lexiconId: "nwl23",
+            boardId: "classic15",
+            analysisPreferences: { candidateLimit: 20, budgetMs: 2000 },
+          },
+          revision: 1,
+          dirty: true,
+          createdAt: "2026-09-27T00:00:00.000Z",
+          savedAt: "2026-09-27T00:00:00.000Z",
+          lastOpenedAt: "2026-09-27T00:00:00.000Z",
+          source: { kind: "imported", format: "gcg", filename: "legacy.gcg" },
+        });
+        transaction
+          .objectStore("meta")
+          .put({ localId: "legacy-shared-scenario" }, "activeScenario");
+        transaction.oncomplete = () => {
+          database.close();
+          resolve();
+        };
+        transaction.onerror = () => reject(transaction.error);
+      };
+    });
+  });
+  await page.reload();
+  await expect(
+    page.getByText(/Recovered local draft|Session ready/),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  const manager = page.getByRole("dialog", { name: "Your workspace" });
+  await manager.getByRole("tab", { name: "Share links" }).click();
+  const source = manager
+    .locator(".share-source-card")
+    .filter({ hasText: "Legacy share owner" });
+  await expect(source).toBeVisible();
+  await source.getByRole("button", { name: /Check|Refresh/ }).click();
+  await expect(source.getByText("1 active link")).toBeVisible();
 });
 
 test("redeems a share fragment into an independent fork scenario", async ({
@@ -550,11 +1040,30 @@ test("redeems a share fragment into an independent fork scenario", async ({
       "Forked from shared scenario revision 2. This session is independent.",
     ),
   ).toBeVisible();
+  await expect(page).not.toHaveURL(/#\/share\//);
   await page.getByRole("button", { name: "Open recent scenarios" }).click();
   await expect(
     page
-      .getByRole("dialog", { name: "Recent scenarios" })
+      .getByRole("dialog", { name: "Your workspace" })
       .getByRole("button", { name: /Open scenario Forked · Shared fixture/ }),
+  ).toBeVisible();
+});
+
+test("removes a share bearer fragment before redemption completes", async ({
+  page,
+}) => {
+  await clearDraft(page);
+  await mockSessionApi(page, { shareRedemptionDelayMs: 700 });
+  await page.goto(
+    "/#/share/e2e-session-abcdefghijkl/share-token-abcdefghijklmnopqrstuvwxyz0123456789",
+  );
+
+  await expect(page).not.toHaveURL(/#\/share\//);
+  await expect(page.getByText("Session ready")).toBeVisible();
+  await expect(
+    page.getByText(
+      "Forked from shared scenario revision 2. This session is independent.",
+    ),
   ).toBeVisible();
 });
 
@@ -600,7 +1109,7 @@ test("desktop edits, exports, imports, and analyzes a position", async ({
   await page.getByRole("button", { name: "Open recent scenarios" }).click();
   await expect(
     page
-      .getByRole("dialog", { name: "Recent scenarios" })
+      .getByRole("dialog", { name: "Your workspace" })
       .getByRole("button", { name: /Open scenario Imported/ }),
   ).toBeVisible();
   await page.getByRole("button", { name: "Close scenarios" }).click();
@@ -879,9 +1388,11 @@ test("recent scenarios switch without losing local positions", async ({
 
   await page.getByRole("button", { name: "Open recent scenarios" }).click();
   await expect(
-    page.getByText("This browser remembers the 100 most recent scenarios."),
+    page.getByText(
+      "This browser shows the 100 most recent scenarios plus any local drafts and the current one.",
+    ),
   ).toBeVisible();
-  const scenarios = page.getByRole("dialog", { name: "Recent scenarios" });
+  const scenarios = page.getByRole("dialog", { name: "Your workspace" });
   await scenarios.getByRole("button", { name: "Blank position" }).click();
   await expect(page.getByText("Session ready")).toBeVisible();
   await enterRack(page, "D");
@@ -890,7 +1401,7 @@ test("recent scenarios switch without losing local positions", async ({
   await expect(page.getByRole("button", { name: "H8 D" })).toBeVisible();
 
   await page.getByRole("button", { name: "Open recent scenarios" }).click();
-  const recent = page.getByRole("dialog", { name: "Recent scenarios" });
+  const recent = page.getByRole("dialog", { name: "Your workspace" });
   await expect(
     recent.getByRole("button", { name: /Open scenario New game/ }),
   ).toHaveCount(1);

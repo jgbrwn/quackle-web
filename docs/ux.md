@@ -69,10 +69,17 @@ ideas without copying the fixed Qt layout:
   and notes. Turns with a usable rack can be analyzed; candidates identify the
   played move when it appears. Replay state survives reload/reconnect, and
   “Edit a copy from here” creates a separate editable scenario.
-- The Scenarios drawer currently switches recent browser-local scenarios.
-  Removing a scenario and managing its share links independently are not yet
-  available; keep local scenario removal distinct from revoking a server-side
-  link when designing that workflow.
+- The Scenarios drawer has separate scenario and share-link management tabs.
+  **Remove from this browser** deletes only the local scenario; share links and
+  recipient forks remain independent. The browser retains a secret-free
+  source-session handle for link management after the source scenario is
+  removed. Dirty removals are warned, Undo is time-limited, active removals
+  switch to another scenario, and cross-tab changes/removals preserve a stale
+  open draft as a saveable copy rather than overwriting newer local state. From
+  a retained source handle, owners can make a new link to the last server-saved
+  snapshot, including after the last active link is revoked; an old one-time
+  bearer URL is never recovered. Share fragments are removed before redemption
+  starts, preventing reloads from accidentally creating another fork.
 
 Reference behaviors were taken from pinned Quackle sources such as
 `quacker/newgame.cpp`, `quacker/graphicalboard.cpp`, `quacker/rackdisplay.cpp`,
