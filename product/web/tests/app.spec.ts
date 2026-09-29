@@ -844,7 +844,7 @@ test("shows and dismisses automatic share-link eviction notices", async ({
   await expect(source.getByText("Link removed automatically")).toHaveCount(0);
 });
 
-test("removing a shared scenario preserves its link for management", async ({
+test("removing a shared scenario preserves revocation access but hides new-link actions", async ({
   page,
 }) => {
   await clearDraft(page);
@@ -897,13 +897,103 @@ test("removing a shared scenario preserves its link for management", async ({
   await source.getByRole("button", { name: /Check|Refresh/ }).click();
   await expect(source.getByText("1 active link")).toBeVisible();
   await expect(source.getByRole("button", { name: "Revoke" })).toBeVisible();
-  await source.getByRole("button", { name: "Create another link" }).click();
-  const replacement = page.getByRole("dialog", { name: "Share scenario" });
+  await expect(source.getByRole("button", { name: /Create/ })).toHaveCount(0);
+  await source.getByRole("button", { name: "Revoke" }).click();
+  const confirm = page.getByRole("alertdialog", { name: "Revoke this link?" });
+  await confirm.getByRole("button", { name: "Revoke link" }).click();
+  await expect(list.locator(".share-source-card")).toHaveCount(0);
   await expect(
-    replacement.getByRole("textbox", { name: "One-time share URL" }),
-  ).toHaveValue(/#\/share\/e2e-session-abcdefghijkl\/share-token-/);
-  await replacement.getByRole("button", { name: "Done" }).click();
-  await expect(source.getByText("2 active links")).toBeVisible();
+    list.getByText(
+      "No known share sources. Create a share link from a scenario to manage it here.",
+    ),
+  ).toBeVisible();
+});
+
+test("removing an unshared scenario prunes its legacy share-source handle", async ({
+  page,
+}) => {
+  await clearDraft(page);
+  await mockSessionApi(page);
+  await page.goto("/");
+  await expect(page.getByText("Session ready")).toBeVisible();
+
+  await page.getByRole("button", { name: "Open recent scenarios" }).click();
+  const workspace = page.getByRole("dialog", { name: "Your workspace" });
+  const scenarioId = await workspace
+    .locator(".scenario-item.active")
+    .getAttribute("data-local-scenario-id");
+  expect(scenarioId).toBeTruthy();
+  const scenario = await readScenarioSnapshot(page, scenarioId!);
+  const sessionId = (scenario.scenario as { sessionId?: string } | null)
+    ?.sessionId;
+  expect(sessionId).toBeTruthy();
+  const title =
+    (scenario.scenario as { title?: string } | null)?.title ??
+    "Removed scenario";
+
+  await page.evaluate(
+    async ({ id, session, scenarioTitle }) => {
+      const request = indexedDB.open("quackle-web-drafts");
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const transaction = database.transaction("shareSources", "readwrite");
+      transaction.objectStore("shareSources").put({
+        sessionId: session,
+        title: scenarioTitle,
+        localId: id,
+        firstSeenAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+      });
+      await new Promise<void>((resolve, reject) => {
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(transaction.error);
+      });
+      database.close();
+    },
+    { id: scenarioId!, session: sessionId!, scenarioTitle: title },
+  );
+
+  await workspace
+    .locator(".scenario-item.active")
+    .getByRole("button", { name: /Remove scenario .* from this browser/ })
+    .click();
+  const remove = page.getByRole("alertdialog", {
+    name: "Remove from this browser?",
+  });
+  await remove
+    .getByRole("button", { name: "Remove from this browser" })
+    .click();
+  await expect(
+    page.getByRole("alertdialog", { name: "Remove from this browser?" }),
+  ).toHaveCount(0);
+  await workspace.getByRole("tab", { name: "Share links" }).click();
+
+  await expect(workspace.locator(".share-source-card")).toHaveCount(0);
+  await expect(
+    workspace.getByText(
+      "No known share sources. Create a share link from a scenario to manage it here.",
+    ),
+  ).toBeVisible();
+  const remainingSources = await page.evaluate(async () => {
+    const request = indexedDB.open("quackle-web-drafts");
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const read = database
+      .transaction("shareSources", "readonly")
+      .objectStore("shareSources")
+      .getAll();
+    const rows = await new Promise<unknown[]>((resolve, reject) => {
+      read.onsuccess = () => resolve(read.result as unknown[]);
+      read.onerror = () => reject(read.error);
+    });
+    database.close();
+    return rows;
+  });
+  expect(remainingSources).toHaveLength(0);
 });
 
 test("removing the active last scenario opens a new game and Undo restores the saved copy", async ({

@@ -26,7 +26,8 @@ export interface ScenarioRecord {
 
 /**
  * Local management handle for a source session. It contains no capability or
- * share bearer token, and survives removal/pruning of the scenario itself.
+ * share bearer token. After local scenario removal, it is retained only while
+ * active links or eviction notices still need owner management.
  */
 export interface ShareSourceRecord {
   sessionId: string;
@@ -392,6 +393,46 @@ export async function listShareSources(): Promise<ShareSourceRecord[]> {
             b.lastSeenAt.localeCompare(a.lastSeenAt),
           ),
         );
+    });
+  });
+}
+
+/**
+ * Forget a detached source only after a successful server check confirmed it
+ * has no active links or notices. A source reattached by Undo wins the race.
+ */
+export async function forgetShareSource(sessionId: string): Promise<boolean> {
+  if (!validSessionId(sessionId)) return false;
+  return withDatabase(async (database) => {
+    return new Promise<boolean>((resolve, reject) => {
+      const transaction = database.transaction(
+        SHARE_SOURCE_STORE_NAME,
+        "readwrite",
+      );
+      const store = transaction.objectStore(SHARE_SOURCE_STORE_NAME);
+      const request = store.get(sessionId);
+      let forgotten = false;
+      request.onsuccess = () => {
+        const source = request.result as ShareSourceRecord | undefined;
+        if (
+          !source ||
+          (source.localId !== null && source.localId !== undefined)
+        ) {
+          return;
+        }
+        store.delete(sessionId);
+        forgotten = true;
+      };
+      request.onerror = () =>
+        reject(request.error ?? new Error("indexeddb_read_failed"));
+      transaction.onerror = () =>
+        reject(transaction.error ?? new Error("indexeddb_write_failed"));
+      transaction.oncomplete = () => {
+        if (forgotten) {
+          publishScenarioEvent({ type: "sources-changed", sessionId });
+        }
+        resolve(forgotten);
+      };
     });
   });
 }

@@ -9,13 +9,14 @@
   recipient-visible label. Renaming later changes future links only; existing
   URLs, snapshots, and recipient forks remain unchanged.
 - Scenarios can be removed from this browser without revoking independent share
-  links. A separate Share links tab preserves source management handles; dirty
-  removals warn, Undo is time-limited, and cross-tab removals preserve drafts.
-- Owners can create a new one-time link from a retained source handle after
-  removing its local scenario; it shares server-saved state, not discarded local
-  edits.
-- The Share links manager keeps zero-link sources available for replacement
-  links, and redemption removes bearer fragments before the request starts.
+  links. The Share links tab retains removed sources while links/notices need
+  management, prunes a source after an authorized check finds none, and hides
+  new-link actions for removed scenarios. Dirty removals warn, Undo is
+  time-limited, and cross-tab removals preserve drafts.
+- New links can be created from saved scenarios; restoring or recreating and
+  activating a removed scenario is required before using **Settings → Share
+  scenario** again. Redemption removes bearer fragments before the request
+  starts.
 - Share creation keeps the one-time bearer URL visible and copyable without
   persisting it. Authorized use renews the session capability cookie; share
   URLs have no scheduled expiry and redemption remains independent of the owner

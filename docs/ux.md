@@ -70,16 +70,19 @@ ideas without copying the fixed Qt layout:
   played move when it appears. Replay state survives reload/reconnect, and
   “Edit a copy from here” creates a separate editable scenario.
 - The Scenarios drawer has separate scenario and share-link management tabs.
-  **Remove from this browser** deletes only the local scenario; share links and
-  recipient forks remain independent. The browser retains a secret-free
-  source-session handle for link management after the source scenario is
-  removed. Dirty removals are warned, Undo is time-limited, active removals
-  switch to another scenario, and cross-tab changes/removals preserve a stale
-  open draft as a saveable copy rather than overwriting newer local state. From
-  a retained source handle, owners can make a new link to the last server-saved
-  snapshot, including after the last active link is revoked; an old one-time
-  bearer URL is never recovered. Share fragments are removed before redemption
-  starts, preventing reloads from accidentally creating another fork.
+  **Remove from this browser** deletes only the local scenario; existing share
+  links and recipient forks remain independent. The browser retains a
+  secret-free source handle while active links or eviction notices still need
+  management. After an authorized check finds neither, it forgets the removed
+  source; offline or unavailable sources remain marked unknown and cannot be
+  re-shared. New links can be created from saved scenarios, not from a removed
+  source handle. Dirty removals are warned, Undo is time-limited, active
+  removals switch to another scenario, and cross-tab changes/removals preserve
+  stale drafts as saveable copies. Old one-time bearer URLs are never recovered.
+  Share fragments are removed before redemption starts, preventing reloads
+  from accidentally creating another fork. To share again after removal,
+  restore/recreate and activate the scenario, then use **Settings → Share
+  scenario**.
 - The Scenarios tab offers **New game**, **Blank position**, and **Import game**
   as sibling ways to start a scenario. GCG file and Cross-Tables URL imports are
   validated before creating a separate scenario; Cross-Tables imports accept

@@ -53,8 +53,12 @@ management, not redemption, and its expiry does not expire the share URL.
 Removing a local scenario is a browser-only IndexedDB action and does not call
 a server-delete endpoint or revoke a snapshot share. Revocation remains a
 separate owner-authorized `DELETE /api/v1/sessions/{id}/share/{shareId}` request.
-The browser retains known source handles after the last link is revoked, so a
-replacement link can be created from the Share links manager.
+The Share links manager keeps a removed source handle while active links or
+eviction notices need management. After an authorized check finds neither, it
+forgets the handle; offline or unavailable sources remain marked unknown. A
+removed source with existing links can still be checked, revoked, or used to
+dismiss eviction notices, but cannot create another link. Creating a new link
+requires a saved scenario.
 Scenario names are browser-local; a new link captures the current name as a
 recipient-visible label. Renaming does not change existing links, snapshots,
 or recipient forks.

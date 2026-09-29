@@ -17,6 +17,7 @@ import {
 } from "../../shared/gcg";
 import {
   deleteScenario,
+  forgetShareSource,
   getScenario,
   listScenarios,
   listShareSources,
@@ -180,6 +181,7 @@ type ShareSourceView = {
   links: ShareLink[];
   notices: ShareLinkNotice[];
   checkedAt?: string;
+  checkedLocalId?: string | null;
 };
 
 type PendingShareRevoke = {
@@ -1087,6 +1089,7 @@ function App() {
   const [shareSourceViews, setShareSourceViews] = useState<
     Record<string, ShareSourceView>
   >({});
+  const [shareSourceSyncRevision, setShareSourceSyncRevision] = useState(0);
   const [shareSourcesLoading, setShareSourcesLoading] = useState(false);
   const [shareSourcesRefreshing, setShareSourcesRefreshing] = useState(false);
   const [shareSourceAction, setShareSourceAction] = useState<string | null>(
@@ -1564,22 +1567,36 @@ function App() {
   useEffect(
     () =>
       subscribeToScenarioEvents((event) => {
+        if (
+          event.type === "removed" ||
+          event.type === "restored" ||
+          event.type === "sources-changed"
+        ) {
+          setShareSourceSyncRevision((revision) => revision + 1);
+        }
         void Promise.all([listScenarios(), listShareSources()])
           .then(([scenarios, sources]) => {
             setScenarioList(scenarios);
             setShareSources(sources);
+            if (event.type !== "sources-changed") return;
+            const sourceStillKnown = sources.some(
+              (source) => source.sessionId === event.sessionId,
+            );
+            setShareSourceViews((previous) => {
+              const next = { ...previous };
+              if (sourceStillKnown) {
+                next[event.sessionId] = {
+                  ...previous[event.sessionId],
+                  status: "unchecked",
+                };
+              } else {
+                delete next[event.sessionId];
+              }
+              return next;
+            });
           })
           .catch(() => undefined);
-        if (event.type === "sources-changed") {
-          setShareSourceViews((previous) => ({
-            ...previous,
-            [event.sessionId]: {
-              ...previous[event.sessionId],
-              status: "unchecked",
-            },
-          }));
-          return;
-        }
+        if (event.type === "sources-changed") return;
         if (event.type !== "removed") return;
         const removedActiveId = activeLocalIdRef.current;
         if (!removedActiveId || !event.localIds.includes(removedActiveId))
@@ -2751,14 +2768,40 @@ function App() {
     }));
     try {
       const collection = await fetchShareCollection(source.sessionId);
-      setShareSourceViews((previous) => ({
-        ...previous,
-        [source.sessionId]: {
-          status: "ready",
-          checkedAt: new Date().toISOString(),
-          ...collection,
-        },
-      }));
+      let currentSources = await listShareSources();
+      let currentSource = currentSources.find(
+        (item) => item.sessionId === source.sessionId,
+      );
+      if (
+        currentSource &&
+        (currentSource.localId === null ||
+          currentSource.localId === undefined) &&
+        collection.links.length === 0 &&
+        collection.notices.length === 0
+      ) {
+        await forgetShareSource(source.sessionId);
+        currentSources = await listShareSources();
+        currentSource = currentSources.find(
+          (item) => item.sessionId === source.sessionId,
+        );
+      }
+      setShareSources(currentSources);
+      setShareSourceViews((previous) => {
+        if (!currentSource) {
+          const next = { ...previous };
+          delete next[source.sessionId];
+          return next;
+        }
+        return {
+          ...previous,
+          [source.sessionId]: {
+            status: "ready",
+            checkedAt: new Date().toISOString(),
+            checkedLocalId: currentSource.localId,
+            ...collection,
+          },
+        };
+      });
     } catch (error) {
       const status =
         !navigator.onLine || error instanceof TypeError
@@ -2788,16 +2831,17 @@ function App() {
           ]),
         ),
       );
-      const sourcesToCheck = force
-        ? sources
-        : sources.filter((source) => {
-            const view = shareSourceViews[source.sessionId];
-            return (
-              view?.status !== "ready" ||
-              !view.checkedAt ||
-              Date.now() - Date.parse(view.checkedAt) > 60_000
-            );
-          });
+      const sourcesToCheck = sources.filter((source) => {
+        const view = shareSourceViews[source.sessionId];
+        if (view?.status === "checking") return false;
+        return (
+          force ||
+          view?.status !== "ready" ||
+          view.checkedLocalId !== source.localId ||
+          !view.checkedAt ||
+          Date.now() - Date.parse(view.checkedAt) > 60_000
+        );
+      });
       let next = 0;
       await Promise.all(
         Array.from({ length: Math.min(4, sourcesToCheck.length) }, async () => {
@@ -2829,7 +2873,7 @@ function App() {
   useEffect(() => {
     if (scenariosOpen && scenarioTab === "shares")
       void refreshAllShareSources(false);
-  }, [scenariosOpen, scenarioTab]);
+  }, [scenariosOpen, scenarioTab, shareSourceSyncRevision]);
 
   useEffect(() => {
     const handleEscape = (event: KeyboardEvent) => {
@@ -3118,6 +3162,12 @@ function App() {
   };
 
   const createShareFromManager = async (source: ShareSourceRecord) => {
+    if (typeof source.localId !== "string") {
+      setStatus(
+        "Restore or recreate this scenario before creating another link",
+      );
+      return;
+    }
     setShareSourceAction(`${source.sessionId}:create`);
     try {
       if (source.localId !== null && source.localId === activeLocalId) {
@@ -3135,7 +3185,10 @@ function App() {
         }
       } else if (source.localId) {
         const savedScenario = await getScenario(source.localId);
-        if (savedScenario?.dirty) throw new Error("local_changes");
+        if (!savedScenario || savedScenario.sessionId !== source.sessionId) {
+          throw new Error("source_removed");
+        }
+        if (savedScenario.dirty) throw new Error("local_changes");
       }
       await createShareLinkForSource(
         source.sessionId,
@@ -3146,6 +3199,10 @@ function App() {
       if (error instanceof Error && error.message === "local_changes") {
         setStatus(
           "Open this scenario and analyze/save its local changes before sharing them",
+        );
+      } else if (error instanceof Error && error.message === "source_removed") {
+        setStatus(
+          "Scenario was removed from this browser · restore it before sharing",
         );
       } else if (
         error instanceof Error &&
@@ -3882,8 +3939,8 @@ function App() {
       scenario.dirty ||
       scenario.localId === activeLocalId,
   );
-  // Keep zero-link sources visible so owners can create a replacement link
-  // from the manager even after revoking the last link.
+  // Show all known handles until the owner check reconciles detached sources;
+  // removed sources with no links/notices are forgotten after that check.
   const displayedShareSources = shareSources;
 
   return (
@@ -5088,31 +5145,32 @@ function App() {
                                       ? "Refresh"
                                       : "Check"}
                                 </button>
-                                {view.status === "ready" && (
-                                  <button
-                                    class="text-button"
-                                    type="button"
-                                    onClick={() =>
-                                      void createShareFromManager(source)
-                                    }
-                                    disabled={actionPending}
-                                  >
-                                    {shareSourceAction ===
-                                    `${source.sessionId}:create`
-                                      ? "Creating…"
-                                      : view.links.length > 0
-                                        ? "Create another link"
-                                        : "Create link"}
-                                  </button>
-                                )}
+                                {view.status === "ready" &&
+                                  typeof source.localId === "string" && (
+                                    <button
+                                      class="text-button"
+                                      type="button"
+                                      onClick={() =>
+                                        void createShareFromManager(source)
+                                      }
+                                      disabled={actionPending}
+                                    >
+                                      {shareSourceAction ===
+                                      `${source.sessionId}:create`
+                                        ? "Creating…"
+                                        : view.links.length > 0
+                                          ? "Create another link"
+                                          : "Create link"}
+                                    </button>
+                                  )}
                               </div>
                             </div>
                             {!source.localId && view.status === "ready" && (
                               <p class="share-manager-warning">
-                                Creating a link shares the source session’s last
-                                saved server snapshot. It cannot recover an
-                                older URL or include unsaved changes from the
-                                removed local scenario.
+                                This scenario was removed from this browser.
+                                Existing links can be revoked here, but create a
+                                new or restored scenario before making another
+                                link.
                               </p>
                             )}
                             {(view.status === "offline" ||
