@@ -35,6 +35,8 @@
   authoritative through HTTP endpoints.
 - The static PWA asset configuration adds standard security response headers
   and a CSP in report-only mode, without changing browser behavior.
+- The preview Worker redirects plain HTTP requests on its public hosts to
+  HTTPS; production rollout remains tracked separately.
 
 - Board cells are sized from one container-query value, stay square when tiles
   are placed, and fit phones down to 320px without horizontal scrolling.

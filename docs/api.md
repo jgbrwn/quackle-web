@@ -82,3 +82,8 @@ The public PWA static-asset configuration supplies baseline security headers
 and a report-only CSP. A separately hosted compatible API must set equivalent
 headers on its own responses; the public repository does not ship the hosted
 Worker implementation.
+
+Use HTTPS for hosted Quackle Web services. The preview Worker redirects plain
+HTTP requests on its public Worker/custom-domain hosts to HTTPS; production
+rollout is tracked separately. Independently hosted compatible APIs should
+enforce HTTPS themselves.
