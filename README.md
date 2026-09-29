@@ -6,6 +6,10 @@ a responsive browser workspace: a board-first editor, rack and blank handling,
 ranked move previews, GCG interoperability, offline drafts, and accessible touch
 and keyboard controls.
 
+### Mobile game replay
+
+![The mobile workspace showing a 15×15 board and replay controls](screenshots/mobile-game-replay.jpg)
+
 This repository is the public source and consumption slice. It intentionally does
 **not** contain hosted-service credentials, account-specific resource names,
 provider state, container images, private runtime state, dictionary binaries, or
