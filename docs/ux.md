@@ -82,9 +82,11 @@ ideas without copying the fixed Qt layout:
   starts, preventing reloads from accidentally creating another fork.
 - The Scenarios tab offers **New game**, **Blank position**, and **Import game**
   as sibling ways to start a scenario. GCG file and Cross-Tables URL imports are
-  validated before creating a separate scenario; a dictionary choice appears
-  when the game does not identify one. Scenario names are browser-local and
-  editable; each new share link captures the name separately for recipients,
+  validated before creating a separate scenario; Cross-Tables imports accept
+  HTTPS links on its two official hostnames, reject embedded credentials and
+  nondefault ports, and normalize the ordinary HTTPS port. A dictionary choice
+  appears when the game does not identify one. Scenario names are browser-local
+  and editable; each new share link captures the name separately for recipients,
   without changing GCG title metadata or existing links/forks.
 
 Reference behaviors were taken from pinned Quackle sources such as

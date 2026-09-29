@@ -28,8 +28,11 @@ ships the contract but not the hosted service implementation.
   history before the request begins.
 - `POST /api/v1/imports/gcg` — validate imported GCG before session creation.
 - `POST /api/v1/imports/cross-tables` — service-side import of one allowlisted
-  Cross-Tables annotated game (Cross-Tables sends no CORS headers). Returns the
-  validated GCG plus the page's declared dictionary.
+  Cross-Tables annotated game (Cross-Tables sends no CORS headers). The link
+  must use HTTPS on the exact `cross-tables.com` or `www.cross-tables.com`
+  hostname, with no encoded host alias, URL credentials, or nondefault port;
+  explicit port 443 is accepted. Returns the validated GCG plus the page's
+  declared dictionary.
 
 HTTP job state is authoritative. WebSocket events are advisory acceleration and
 clients must reconcile by revision/sequence after reconnecting.

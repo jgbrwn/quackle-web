@@ -27,6 +27,9 @@
 - The HTTP contract documents origin, request-size, and admission-limit
   responses so clients can handle `403`, `413`, and `429` without changing the
   existing sharing or import workflows.
+- Cross-Tables URL validation rejects embedded credentials, encoded host
+  aliases, and nondefault HTTPS ports while continuing to accept ordinary
+  HTTPS port 443 links.
 
 - Board cells are sized from one container-query value, stay square when tiles
   are placed, and fit phones down to 320px without horizontal scrolling.

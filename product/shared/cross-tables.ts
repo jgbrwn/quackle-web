@@ -15,12 +15,37 @@ export class CrossTablesUrlError extends Error {
   }
 }
 
-function requireAllowedHost(url: URL): void {
+function requireAllowedHost(url: URL, original: string): void {
   if (url.protocol !== "https:")
     throw new CrossTablesUrlError(
       "https_required",
       "Cross-Tables links must use HTTPS",
     );
+  // The URL parser can normalize backslashes and erase an empty `@` userinfo
+  // delimiter, so inspect the raw authority as well as parsed credentials.
+  const normalizedOriginal = original
+    .replace(/[\t\n\r]/g, "")
+    .replaceAll("\\", "/");
+  const authority =
+    normalizedOriginal.match(/^[a-z][a-z0-9+.-]*:\/{0,}([^/?#]*)/i)?.[1] ?? "";
+  if (url.username !== "" || url.password !== "" || authority.includes("@")) {
+    throw new CrossTablesUrlError(
+      "credentials_not_allowed",
+      "Cross-Tables links must not contain URL credentials",
+    );
+  }
+  if (url.port !== "") {
+    throw new CrossTablesUrlError(
+      "port_not_allowed",
+      "Cross-Tables links must use the default HTTPS port",
+    );
+  }
+  if (authority.includes("%")) {
+    throw new CrossTablesUrlError(
+      "host_not_allowed",
+      "URL host is not an allowed Cross-Tables host",
+    );
+  }
   if (!ALLOWED_HOSTS.has(url.hostname.toLowerCase()))
     throw new CrossTablesUrlError(
       "host_not_allowed",
@@ -44,16 +69,17 @@ function parseGameId(value: string): number {
 }
 
 export function parseCrossTablesUrl(input: string): CrossTablesLink {
+  const original = input.trim();
   let url: URL;
   try {
-    url = new URL(input.trim());
+    url = new URL(original);
   } catch {
     throw new CrossTablesUrlError(
       "invalid_url",
       "Enter a complete Cross-Tables URL",
     );
   }
-  requireAllowedHost(url);
+  requireAllowedHost(url, original);
   if (url.pathname !== "/annotated.php")
     throw new CrossTablesUrlError(
       "path_not_allowed",
@@ -66,25 +92,27 @@ export function parseCrossTablesUrl(input: string): CrossTablesLink {
       "URL must contain only the numeric u game id",
     );
   const gameId = parseGameId(url.searchParams.get("u") ?? "");
-  url.hostname = "www.cross-tables.com";
-  url.hash = "";
-  return { url: url.toString(), gameId };
+  return {
+    url: `https://www.cross-tables.com/annotated.php?u=${gameId}`,
+    gameId,
+  };
 }
 
 export function parseCrossTablesGcgUrl(
   input: string,
   expectedGameId?: number,
 ): string {
+  const original = input.trim();
   let url: URL;
   try {
-    url = new URL(input.trim());
+    url = new URL(original);
   } catch {
     throw new CrossTablesUrlError(
       "invalid_gcg_url",
       "Cross-Tables GCG link is malformed",
     );
   }
-  requireAllowedHost(url);
+  requireAllowedHost(url, original);
   if (
     url.search ||
     url.hash ||
@@ -105,8 +133,16 @@ export function parseCrossTablesGcgUrl(
       "GCG link does not match the requested Cross-Tables game",
     );
   }
-  url.hostname = "www.cross-tables.com";
-  return url.toString();
+  return `https://www.cross-tables.com${url.pathname}`;
+}
+
+function resolveCrossTablesPageHref(href: string, baseUrl: string): string {
+  const trimmed = href.trim();
+  if (/^[a-z][a-z0-9+.-]*:/i.test(trimmed)) return trimmed;
+  // Keep network-path authorities raw until the GCG URL validator checks them.
+  if (/^[\\/]{2}/.test(trimmed))
+    return `https:${trimmed.replaceAll("\\", "/")}`;
+  return new URL(trimmed, baseUrl).toString();
 }
 
 export interface CrossTablesPageInfo {
@@ -137,7 +173,7 @@ export function parseCrossTablesPage(
   )) {
     try {
       gcgUrl = parseCrossTablesGcgUrl(
-        new URL(match[2]!, link.url).toString(),
+        resolveCrossTablesPageHref(match[2]!, link.url),
         link.gameId,
       );
       break;

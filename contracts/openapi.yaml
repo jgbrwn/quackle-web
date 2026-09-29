@@ -103,7 +103,10 @@ paths:
         Fetch one allowlisted Cross-Tables annotated game and its matching GCG
         download server-side (Cross-Tables sends no CORS headers), then validate
         it like an upload. The page's declared dictionary is used when the GCG
-        has no #lexicon pragma.
+        has no #lexicon pragma. Input must use an exact HTTPS hostname of
+        cross-tables.com or www.cross-tables.com, without encoded host aliases,
+        URL credentials, or a nondefault port; explicit port 443 is accepted
+        and canonicalized away.
       requestBody:
         required: true
         content:
@@ -115,7 +118,7 @@ paths:
                 url:
                   {
                     type: string,
-                    description: "https://www.cross-tables.com/annotated.php?u=<numeric id>",
+                    description: "HTTPS Cross-Tables annotated.php URL with one numeric u game id; no credentials or nondefault port.",
                   }
       responses:
         "200":
@@ -128,8 +131,7 @@ paths:
         "415": { description: Content-Type must be application/json. }
         "422":
           {
-            description: URL is not an allowlisted annotated-game link,
-            or GCG is invalid.,
+            description: "URL is not an allowlisted annotated-game link, or GCG is invalid.",
           }
         "502": { description: Cross-Tables could not be reached. }
         "429": { $ref: "#/components/responses/RateLimited" }
