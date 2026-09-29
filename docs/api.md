@@ -35,7 +35,10 @@ ships the contract but not the hosted service implementation.
   declared dictionary.
 
 HTTP job state is authoritative. WebSocket events are advisory acceleration and
-clients must reconcile by revision/sequence after reconnecting.
+clients must reconcile by revision/sequence after reconnecting. A compatible
+service may replay up to 100 contiguous session events; if the cursor is stale,
+future, or crosses a missing sequence, it may send a current `session.snapshot`
+instead of a partial event replay.
 
 ## Security expectations
 
@@ -58,6 +61,11 @@ or recipient forks.
 
 All mutations use an expected revision or idempotency key. Imported files are
 bounded text data, never filenames, paths, archives, commands, or configuration.
+Analysis-job idempotency keys deduplicate matching requests for 24 hours after
+creation and remain associated while the job is in progress; a different
+request using the same key during that period conflicts. The request's
+`sessionRevision` must still be current; stale-revision requests conflict
+before idempotency replay.
 
 Browser clients should send cookie-authenticated mutations and WebSocket
 upgrades from the same allowed application origin. Compatible services may

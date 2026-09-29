@@ -326,6 +326,12 @@ paths:
       - $ref: "#/components/parameters/SessionId"
     post:
       operationId: createAnalysisJob
+      description: >-
+        Idempotency-Key deduplicates equivalent job requests for 24 hours after
+        creation and remains associated with a job while it is in progress.
+        Reusing the same key with different options during that period returns
+        a conflict. The sessionRevision must still match current session state;
+        stale-revision requests return a conflict before idempotency replay.
       parameters:
         - name: Idempotency-Key
           in: header
@@ -406,7 +412,11 @@ paths:
       description: >-
         WebSocket upgrade for session events. The browser Origin must match
         this API origin (or an explicitly configured origin); sync messages
-        are limited to 1 KiB and oversized messages close with code 1009.
+        are limited to 1 KiB and oversized messages close with code 1009. Event
+        replay is bounded to the latest 100 contiguous events; when the cursor
+        is stale, future, or crosses a missing sequence, the server sends a
+        current session snapshot instead of a partial replay. Job state remains
+        authoritative through the HTTP job endpoints.
       responses:
         "101": { description: Switching Protocols }
         "400": { $ref: "#/components/responses/BadRequest" }
