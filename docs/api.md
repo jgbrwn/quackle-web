@@ -83,7 +83,8 @@ and a report-only CSP. A separately hosted compatible API must set equivalent
 headers on its own responses; the public repository does not ship the hosted
 Worker implementation.
 
-Use HTTPS for hosted Quackle Web services. The preview Worker redirects plain
-HTTP requests on its public Worker/custom-domain hosts to HTTPS; production
-rollout is tracked separately. Independently hosted compatible APIs should
-enforce HTTPS themselves.
+Use HTTPS for hosted Quackle Web services. The production and preview Workers
+redirect plain HTTP requests on their public Worker/custom-domain hosts to
+HTTPS. The production Worker and static assets supply baseline security
+headers, with CSP in report-only mode. Independently hosted compatible APIs
+should enforce HTTPS and configure their own security headers.
