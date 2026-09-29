@@ -77,3 +77,8 @@ CORS. Do not use wildcard CORS with capability cookies.
 
 See [`contracts/openapi.yaml`](../contracts/openapi.yaml) for the machine-readable
 HTTP contract.
+
+The public PWA static-asset configuration supplies baseline security headers
+and a report-only CSP. A separately hosted compatible API must set equivalent
+headers on its own responses; the public repository does not ship the hosted
+Worker implementation.
