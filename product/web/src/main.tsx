@@ -4099,6 +4099,11 @@ function App() {
                   {boardCells.map((index) => {
                     const cell = previewCells[index];
                     const isPreview = !visibleCells[index] && Boolean(cell);
+                    const tilePoints = cell
+                      ? cell.blank
+                        ? 0
+                        : (TILE_VALUES[cell.letter] ?? 0)
+                      : undefined;
                     const premium = classicPremiumAt(
                       Math.floor(index / SIZE),
                       index % SIZE,
@@ -4125,24 +4130,35 @@ function App() {
                         data-board-cell-index={index}
                         tabIndex={activeCellIndex === index ? 0 : -1}
                         disabled={isReplaying}
+                        aria-description={
+                          tilePoints === undefined
+                            ? undefined
+                            : `${tilePoints} point${tilePoints === 1 ? "" : "s"}`
+                        }
                         aria-label={`${positionFor(index)}${cell ? ` ${isPreview ? "preview " : ""}${cell.blank ? "blank " : ""}${cell.letter}` : " empty"}${premiumText ? `, ${premiumText}` : ""}`}
                       >
-                        {cell?.letter ??
-                          (!cell && premium !== "" ? (
-                            <small>
-                              {premium === "center"
-                                ? "★"
-                                : premium === "triple-word"
-                                  ? "TW"
-                                  : premium === "double-word"
-                                    ? "DW"
-                                    : premium === "triple-letter"
-                                      ? "TL"
-                                      : "DL"}
+                        {cell ? (
+                          <>
+                            <span class="board-tile-letter">{cell.letter}</span>
+                            <small class="board-tile-value" aria-hidden="true">
+                              {tilePoints}
                             </small>
-                          ) : (
-                            ""
-                          ))}
+                          </>
+                        ) : premium !== "" ? (
+                          <small>
+                            {premium === "center"
+                              ? "★"
+                              : premium === "triple-word"
+                                ? "TW"
+                                : premium === "double-word"
+                                  ? "DW"
+                                  : premium === "triple-letter"
+                                    ? "TL"
+                                    : "DL"}
+                          </small>
+                        ) : (
+                          ""
+                        )}
                       </button>
                     );
                   })}

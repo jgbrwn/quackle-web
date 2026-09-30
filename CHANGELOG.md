@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Occupied board tiles now show their face-value points instead of a decorative
+  dot; blank tiles show zero.
 - Scenarios have editable browser-local names, and **Import game** is a first-
   class Scenarios action for GCG files and Cross-Tables URLs. Imports are
   validated and named before creating a new scenario.

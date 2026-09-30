@@ -1544,9 +1544,18 @@ test("replays imported GCG records and returns to the editable final position", 
   await page.getByRole("button", { name: "Next" }).click();
   await expect(page.getByText("Record 1 of 7")).toBeVisible();
   await expect(page.getByRole("button", { name: "H8 A" })).toBeVisible();
+  const twoPointTile = page.getByRole("button", { name: "D8 D" });
+  await expect(twoPointTile.locator(".board-tile-value")).toHaveText("2");
+  await expect(twoPointTile).toHaveAttribute("aria-description", "2 points");
+  const onePointTile = page.getByRole("button", { name: "H8 A" });
+  await expect(onePointTile.locator(".board-tile-value")).toHaveText("1");
+  await expect(onePointTile).toHaveAttribute("aria-description", "1 point");
   await page.getByRole("button", { name: "Next" }).click();
   await page.getByRole("button", { name: "Next" }).click();
   await expect(page.getByRole("button", { name: "D7 blank A" })).toBeVisible();
+  const blankTile = page.getByRole("button", { name: "D7 blank A" });
+  await expect(blankTile.locator(".board-tile-value")).toHaveText("0");
+  await expect(blankTile).toHaveAttribute("aria-description", "0 points");
   await page.getByRole("button", { name: "Next" }).click();
   await expect(page.getByRole("button", { name: "D7 empty" })).toBeVisible();
   await page.getByRole("button", { name: "Return to final" }).click();

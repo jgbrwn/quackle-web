@@ -60,8 +60,9 @@ ideas without copying the fixed Qt layout:
 - The board now uses the canonical classic premium layout, including triple
   letters; board editing has roving keyboard focus, across/down navigation,
   blank-letter selection, an in-app tile keyboard, rack editing/shuffle, and
-  Pointer Events drag from rack to board. Buttons are used for mobile tile entry
-  so editing does not summon the native keyboard.
+  Pointer Events drag from rack to board. Occupied tiles show their face-value
+  points at the lower right (zero for blanks), and buttons are used for mobile
+  tile entry so editing does not summon the native keyboard.
 - About/Legal is available from desktop and mobile and shows engine, lexicon,
   provenance/disclosure, offline behavior, and links to the data tools.
 - Imported GCG/Cross-Tables games replay by history record with both player

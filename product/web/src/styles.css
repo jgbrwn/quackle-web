@@ -446,14 +446,21 @@ select:focus-visible {
   color: #262b26;
   box-shadow: inset 0 0 0 1px rgba(85, 68, 34, 0.15);
 }
-.board-cell.occupied::after {
-  content: "";
+.board-tile-letter {
+  grid-area: 1 / 1;
+  line-height: 1;
+}
+.board-cell .board-tile-value {
   position: absolute;
-  inset: auto 2px 2px auto;
-  width: 3px;
-  height: 3px;
-  border-radius: 50%;
-  background: #bb8650;
+  inset: auto 2px 1px auto;
+  z-index: 1;
+  color: #826a3e;
+  font-size: max(6px, calc(var(--cell) * 0.22));
+  font-style: normal;
+  font-weight: 750;
+  letter-spacing: -0.03em;
+  line-height: 1;
+  text-transform: none;
 }
 .board-cell.blank-tile {
   color: #a0522d;
