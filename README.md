@@ -8,7 +8,7 @@ and keyboard controls.
 
 ### Mobile game replay
 
-![Mobile GCG replay with face-value points shown on board tiles](screenshots/mobile-game-replay.jpg)
+![Mobile GCG replay with face-value points shown on board tiles](screenshots/mobile-game-replay-20260930-b0bc41eb611a.jpg)
 
 This repository is the public source and consumption slice. It intentionally does
 **not** contain hosted-service credentials, account-specific resource names,
